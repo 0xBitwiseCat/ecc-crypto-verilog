@@ -13,35 +13,31 @@ const uint256_t P_MOD = uint256_t("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 const uint256_t G_X = uint256_t("0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
 const uint256_t G_Y = uint256_t("0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8");
 
-// Estructura de punto en coordenadas Jacobianas (3 coordenadas de 32 bytes c/u = 96 bytes)
+// Contadores de Hardware (Métricas de Operación)
+uint64_t hw_add_count = 0;
+uint64_t hw_dbl_count = 0;
+
+// Estructura de punto en coordenadas Jacobianas
 struct Point {
     uint256_t X, Y, Z;
     bool is_infinity;
-    
     static Point infinity() { return {0, 0, 0, true}; }
 };
 
 // ==========================================================
 // ALU Modular (Simulación del Datapath)
 // ==========================================================
-inline uint256_t mod_add(const uint256_t& a, const uint256_t& b) {
-    return (a + b) % P_MOD;
-}
-
-inline uint256_t mod_sub(const uint256_t& a, const uint256_t& b) {
-    if (a >= b) return a - b;
-    return P_MOD - b + a;
-}
-
-inline uint256_t mod_mul(const uint256_t& a, const uint256_t& b) {
-    return (a * b) % P_MOD;
-}
+inline uint256_t mod_add(const uint256_t& a, const uint256_t& b) { return (a + b) % P_MOD; }
+inline uint256_t mod_sub(const uint256_t& a, const uint256_t& b) { return (a >= b) ? a - b : P_MOD - b + a; }
+inline uint256_t mod_mul(const uint256_t& a, const uint256_t& b) { return (a * b) % P_MOD; }
 
 // ==========================================================
-// Máquina Geometría (FSM de Puntos)
+// FSM de Puntos (Con Contadores Habilitados)
 // ==========================================================
 Point point_double(const Point& p) {
     if (p.is_infinity || p.Y == 0) return Point::infinity();
+    
+    hw_dbl_count++; // Contabilizar operación de hardware
 
     uint256_t Y_sq = mod_mul(p.Y, p.Y);
     uint256_t S = mod_mul(4, mod_mul(p.X, Y_sq));
@@ -58,13 +54,13 @@ Point point_double(const Point& p) {
 Point point_add(const Point& p1, const Point& p2) {
     if (p1.is_infinity) return p2;
     if (p2.is_infinity) return p1;
+    
+    hw_add_count++; // Contabilizar operación de hardware
 
     uint256_t Z1_sq = mod_mul(p1.Z, p1.Z);
     uint256_t Z2_sq = mod_mul(p2.Z, p2.Z);
-
     uint256_t U1 = mod_mul(p1.X, Z2_sq);
     uint256_t U2 = mod_mul(p2.X, Z1_sq);
-
     uint256_t S1 = mod_mul(p1.Y, mod_mul(p2.Z, Z2_sq));
     uint256_t S2 = mod_mul(p2.Y, mod_mul(p1.Z, Z1_sq));
 
@@ -87,11 +83,11 @@ Point point_add(const Point& p1, const Point& p2) {
 }
 
 // ==========================================================
-// Controlador Algoritmo: Ventana Deslizante (Sliding Window)
+// Controlador Algoritmo: Ventana Deslizante (Impares)
 // ==========================================================
-Point sliding_window_kP(uint16_t k, int w, const Point& G, const std::vector<Point>& precomp) {
+Point sliding_window_kP(uint32_t k, int w, const std::vector<Point>& precomp) {
     Point Q = Point::infinity();
-    int i = 15; 
+    int i = 20; // Modificado para soportar hasta 2^20 (21 bits)
 
     while (i >= 0) {
         if (((k >> i) & 1) == 0) {
@@ -113,6 +109,7 @@ Point sliding_window_kP(uint16_t k, int w, const Point& G, const std::vector<Poi
                 Q = point_double(Q);
             }
             
+            // Acceso directo a memoria: O(1)
             Q = point_add(Q, precomp[value / 2]);
             i -= length; 
         }
@@ -121,35 +118,36 @@ Point sliding_window_kP(uint16_t k, int w, const Point& G, const std::vector<Poi
 }
 
 // ==========================================================
-// Motor de Benchmark y Generación de CSV
+// Motor de Benchmark
 // ==========================================================
 int main() {
     Point G = {G_X, G_Y, 1, false};
+    uint32_t MAX_K = 1048576; // 2^20
     
-    std::ofstream csv("performance_results.csv");
-    // Añadidas las columnas de Número Máximo y Memoria
-    csv << "Window_Size,Max_Window_Value,Precomp_Points,Memory_Bytes,Total_Time_us,Avg_Time_ns_per_k\n";
+    std::ofstream csv("performance_odds_results.csv");
+    // Formato idéntico al benchmark de primos para cruzar datos fácilmente
+    csv << "Window_Size,Precomp_Points,Memory_Bytes,Avg_Time_ns,Avg_Adds,Avg_Doubles,Avg_Total_Ops\n";
     
-    std::cout << "========================================================================\n";
-    std::cout << " BENCHMARK: VENTANA DESLIZANTE (w = 1 a 8) para k = 1..65535\n";
-    std::cout << "========================================================================\n";
-    std::cout << std::left << std::setw(4) << "w" 
-              << std::setw(12) << "| Max Val" 
-              << std::setw(12) << "| Puntos" 
-              << std::setw(15) << "| Memoria (B)" 
-              << "| Avg Tiempo (ns)\n";
-    std::cout << "------------------------------------------------------------------------\n";
+    std::cout << "========================================================================================\n";
+    std::cout << " BENCHMARK: SLIDING WINDOW BASADO EN IMPARES (w = 1 a 8) para k = 1..1048576\n";
+    std::cout << "========================================================================================\n";
+    std::cout << std::left << std::setw(3) << "w" 
+              << std::setw(9) << "| Puntos" 
+              << std::setw(12) << "| Mem (B)" 
+              << std::setw(14) << "| Avg T(ns)" 
+              << std::setw(12) << "| Avg Adds" 
+              << std::setw(12) << "| Avg Dbls" 
+              << "| Total Ops\n";
+    std::cout << "----------------------------------------------------------------------------------------\n";
 
     for (int w = 1; w <= 8; ++w) {
-        // --- 1. Cálculo de Métricas Físicas ---
-        int max_window_val = (1 << w) - 1;       // 2^w - 1
-        int num_precomp = 1 << (w - 1);          // 2^(w-1)
-        int memory_bytes = num_precomp * 96;     // 96 bytes por punto Jacobiano (3x32B)
+        int num_precomp = 1 << (w - 1);
+        int memory_bytes = num_precomp * 96;
 
-        // --- 2. Fase de Precomputación (Memoria) ---
+        // 1. Fase de Precomputación (Deshabilitando contadores)
+        hw_add_count = 0; hw_dbl_count = 0;
         std::vector<Point> precomp(num_precomp);
         precomp[0] = G; 
-        
         if (num_precomp > 1) {
             Point G2 = point_double(G); 
             for (int i = 1; i < num_precomp; ++i) {
@@ -157,42 +155,40 @@ int main() {
             }
         }
 
-        // --- 3. Fase de Ejecución (Test k = 1 to 65535) ---
+        // 2. Fase de Ejecución
+        hw_add_count = 0; hw_dbl_count = 0; // Reiniciar para capturar solo el costo de evaluación
         auto start_time = std::chrono::high_resolution_clock::now();
         uint256_t dummy_sink = 0; 
 
-        for (uint32_t k = 1; k <= 65535; ++k) {
-            Point Q = sliding_window_kP(k, w, G, precomp);
-            dummy_sink ^= Q.X; // Usamos XOR para obligar al compilador a calcular Q.X
+        for (uint32_t k = 1; k <= MAX_K; ++k) {
+            Point Q = sliding_window_kP(k, w, precomp);
+            dummy_sink ^= Q.X; 
         }
         
         auto end_time = std::chrono::high_resolution_clock::now();
-        
-        // Operación invisible para asegurar que GCC no elimine todo el proceso por optimización (-O3)
         if (dummy_sink == 1) { std::cout << ""; }
         
-        // --- 4. Métricas de Tiempo ---
+        // 3. Procesamiento de Métricas
         auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        double avg_ns = (duration_us * 1000.0) / 65535.0;
+        double avg_ns = (duration_us * 1000.0) / MAX_K;
+        double avg_adds = (double)hw_add_count / MAX_K;
+        double avg_dbls = (double)hw_dbl_count / MAX_K;
+        double avg_total = avg_adds + avg_dbls;
 
-        // Escribir a CSV
-        csv << w << "," 
-            << max_window_val << "," 
-            << num_precomp << "," 
-            << memory_bytes << "," 
-            << duration_us << "," 
-            << std::fixed << std::setprecision(2) << avg_ns << "\n";
+        csv << w << "," << num_precomp << "," << memory_bytes << "," 
+            << std::fixed << std::setprecision(2) << avg_ns << "," 
+            << avg_adds << "," << avg_dbls << "," << avg_total << "\n";
             
-        // Imprimir en consola
-        std::cout << std::left << std::setw(4) << w 
-                  << "| " << std::setw(9) << max_window_val 
-                  << "| " << std::setw(9) << num_precomp 
-                  << "| " << std::setw(12) << memory_bytes 
-                  << "| " << avg_ns << " ns\n";
+        std::cout << std::left << std::setw(3) << w 
+                  << "| " << std::setw(6) << num_precomp 
+                  << "| " << std::setw(9) << memory_bytes 
+                  << "| " << std::setw(11) << std::fixed << std::setprecision(2) << avg_ns
+                  << "| " << std::setw(9) << avg_adds 
+                  << "| " << std::setw(9) << avg_dbls 
+                  << "| " << avg_total << "\n";
     }
 
     csv.close();
-    std::cout << "------------------------------------------------------------------------\n";
-    std::cout << "Archivo 'performance_results.csv' generado exitosamente.\n";
+    std::cout << "----------------------------------------------------------------------------------------\n";
     return 0;
 }
