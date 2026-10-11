@@ -1,52 +1,38 @@
-`timescale 1ns / 1ps
-
 // ============================================================================
-// MÓDULO: RAM de Puntos Jacobianos (256-bit x 3)
-// OBJETIVO: Almacenar los múltiplos precalculados para la ventana deslizante
+// Módulo: ecc_point_ram.v
+// Objetivo: Almacenamiento de puntos precomputados (coordenadas Jacobianas/Afines)
+// Optimizado para: Intel Cyclone IV (Inferencia nativa de Bloques M9K)
 // ============================================================================
 
 module ecc_point_ram #(
-    parameter W = 256,
-    parameter ADDR_BITS = 5 // 32 posiciones (suficiente para índices 0 a 18)
+    parameter DATA_WIDTH = 256,  // Ancho de palabra para coordenadas de 256 bits (secp256k1 / NIST P-256)
+    parameter ADDR_WIDTH = 4     // 2^4 = 16 posiciones (suficiente para tabla de precomputo con w=4)
 )(
-    input  wire                 clk,
+    input  wire                  clk,
     
-    // ==========================================
-    // PUERTO 0: ESCRITURA (Usado por el Pre-calculador)
-    // ==========================================
-    input  wire                 we,          // Write Enable
-    input  wire [ADDR_BITS-1:0] addr_w,      // Dirección de escritura
-    input  wire [W-1:0]         X_w,         // Coordenada X a guardar
-    input  wire [W-1:0]         Y_w,         // Coordenada Y a guardar
-    input  wire [W-1:0]         Z_w,         // Coordenada Z a guardar
+    // --- Puerto de Escritura ---
+    input  wire                  we,
+    input  wire [ADDR_WIDTH-1:0] write_addr,
+    input  wire [DATA_WIDTH-1:0] data_in,
     
-    // ==========================================
-    // PUERTO 1: LECTURA (Usado por ecc_sliding_window_engine)
-    // ==========================================
-    input  wire [ADDR_BITS-1:0] addr_r,      // Dirección de lectura
-    output reg  [W-1:0]         X_r,         // Coordenada X leída
-    output reg  [W-1:0]         Y_r,         // Coordenada Y leída
-    output reg  [W-1:0]         Z_r          // Coordenada Z leída
+    // --- Puerto de Lectura ---
+    input  wire [ADDR_WIDTH-1:0] read_addr,
+    output reg  [DATA_WIDTH-1:0] data_out
 );
 
-    // Arrays de memoria para cada coordenada (Inferencia de BRAM)
-    reg [W-1:0] mem_X [0:(1<<ADDR_BITS)-1];
-    reg [W-1:0] mem_Y [0:(1<<ADDR_BITS)-1];
-    reg [W-1:0] mem_Z [0:(1<<ADDR_BITS)-1];
+    // Directiva explícita de síntesis para Quartus Prime / Quartus II
+    (* ramstyle = "M9K, no_rw_check" *) reg [DATA_WIDTH-1:0] ram [0:(1<<ADDR_WIDTH)-1];
 
-    // Operación Síncrona de Escritura y Lectura
+    // 1. Escritura Síncrona
     always @(posedge clk) begin
         if (we) begin
-            mem_X[addr_w] <= X_w;
-            mem_Y[addr_w] <= Y_w;
-            mem_Z[addr_w] <= Z_w;
+            ram[write_addr] <= data_in;
         end
-        
-        // La lectura es síncrona para asegurar que se utilicen Block RAMs de la FPGA
-        // y no LUTs (Flip-Flops), ahorrando drásticamente el área lógica.
-        X_r <= mem_X[addr_r];
-        Y_r <= mem_Y[addr_r];
-        Z_r <= mem_Z[addr_r];
+    end
+
+    // 2. Lectura Estrictamente Síncrona (Requisito fundamental para inferir M9K)
+    always @(posedge clk) begin
+        data_out <= ram[read_addr];
     end
 
 endmodule

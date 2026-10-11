@@ -48,9 +48,30 @@ module jacobian_point_add #(
     );
 
     // 3. ALU COMBINACIONAL
-    wire [W:0] sum_val = mult_A + mult_B; 
-    wire [W-1:0] mod_add_res = (sum_val >= P_MOD) ? (sum_val - P_MOD) : sum_val;
-    wire [W-1:0] mod_sub_res = (mult_A >= mult_B) ? (mult_A - mult_B) : (mult_A + P_MOD - mult_B);
+    // Señales de control y datos compartidos para la ALU modular
+    reg start_add, start_sub;
+    wire done_add, done_sub;
+    
+    // Multiplexores de entrada controlados por la FSM
+    reg [W-1:0] alu_add_A, alu_add_B;
+    reg [W-1:0] alu_sub_A, alu_sub_B;
+    
+    // Cables de salida
+    wire [W-1:0] res_add, res_sub;
+
+    // Instancia ÚNICA del sumador
+    mod_add #(256) u_mod_add (
+        .clk(clk), .rst_n(rst_n), .start(start_add),
+        .A(alu_add_A), .B(alu_add_B), .P(P_MOD),
+        .res(res_add), .done(done_add)
+    );
+
+    // Instancia ÚNICA del restador
+    mod_sub #(256) u_mod_sub (
+        .clk(clk), .rst_n(rst_n), .start(start_sub),
+        .A(alu_sub_A), .B(alu_sub_B), .P(P_MOD),
+        .res(res_sub), .done(done_sub)
+    );
 
     // 4. MÁQUINA DE ESTADOS FINITOS (Actualizada a 6 bits para soportar más de 31 estados)
     reg [5:0] state;
