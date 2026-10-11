@@ -1,430 +1,363 @@
-`timescale 1ns / 1ps
-
 // ============================================================================
-// MÓDULO: Suma de Puntos Jacobianos (P + Q)
-// OBJETIVO: Optimización extrema de Área mediante "Resource Sharing"
-// MATEMÁTICA: X3, Y3, Z3 a partir de (X1,Y1,Z1) + (X2,Y2,Z2)
+// Módulo: jacobian_point_add.v (Genérico / Curve-Agnostic)
+// Operación: P3 (X3, Y3, Z3) = P1 (X1, Y1, Z1) + P2 (X2, Y2, Z2)
+// Coordenadas: Jacobianas (x = X/Z^2, y = Y/Z^3)
+// Optimizado para: Intel Cyclone IV (Reutiliza el Multiplicador de Montgomery)
 // ============================================================================
 
 module jacobian_point_add #(
-    parameter W = 256
+    parameter WIDTH = 256
 )(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,
-    
-    // Punto P
-    input  wire [W-1:0] X1, Y1, Z1,
-    // Punto Q
-    input  wire [W-1:0] X2, Y2, Z2,
-    // Módulo de la curva
-    input  wire [W-1:0] P_MOD,
-    
-    // Resultado Punto R = P+Q
-    output reg  [W-1:0] X3, Y3, Z3,
-    output reg          done
+    input  wire                 clk,
+    input  wire                 rst_n,
+
+    // Control
+    input  wire                 start,
+    output reg                  done,
+    output reg                  busy,
+    output reg                  is_double, // Indica si P1 == P2 (requiere Point Double)
+
+    // Entradas P1, P2 y Módulo P (en dominio Montgomery)
+    input  wire [WIDTH-1:0]     x1, y1, z1,
+    input  wire [WIDTH-1:0]     x2, y2, z2,
+    input  wire [WIDTH-1:0]     p,
+
+    // Salidas P3
+    output reg  [WIDTH-1:0]     x3, y3, z3,
+
+    // Interfaz con el Multiplicador de Montgomery compartido
+    output reg                  mult_start,
+    output reg  [WIDTH-1:0]     mult_a,
+    output reg  [WIDTH-1:0]     mult_b,
+    input  wire                 mult_done,
+    input  wire [WIDTH-1:0]     mult_result
 );
 
-    // 1. REGISTROS INTERNOS TEMPORALES
-    reg [W-1:0] T1, T2, T3, T4; 
-    reg [W-1:0] U1, U2, S1, S2, H, R;
+    // ------------------------------------------------------------------------
+    // Funciones Modulares Axiliares (Aritmética combinacional)
+    // ------------------------------------------------------------------------
+    function [WIDTH-1:0] mod_add;
+        input [WIDTH-1:0] a, b, mod;
+        reg [WIDTH:0] sum;
+        begin
+            sum = a + b;
+            mod_add = (sum >= mod) ? (sum - mod) : sum[WIDTH-1:0];
+        end
+    endfunction
 
-    // 2. INTERFAZ DEL MULTIPLICADOR ÚNICO
-    reg          mult_start;
-    reg  [W-1:0] mult_A;
-    reg  [W-1:0] mult_B;
-    wire [W-1:0] mult_out;
-    wire         mult_done;
+    function [WIDTH-1:0] mod_sub;
+        input [WIDTH-1:0] a, b, mod;
+        begin
+            mod_sub = (a >= b) ? (a - b) : (a + mod - b);
+        end
+    endfunction
 
-    montgomery_multiplier #(.W(W)) u_mult (
-        .clk(clk),
-        .rst(rst),
-        .start(mult_start),
-        .A(mult_A),
-        .B(mult_B),
-        .P(P_MOD),
-        .S_out(mult_out),
-        .done(mult_done)
-    );
-
-    // 3. ALU COMBINACIONAL
-    // Señales de control y datos compartidos para la ALU modular
-    reg start_add, start_sub;
-    wire done_add, done_sub;
+    // ------------------------------------------------------------------------
+    // Codificación de Estados
+    // ------------------------------------------------------------------------
+    localparam ST_IDLE       = 5'd0;
+    localparam ST_CHECK_ZERO = 5'd1;
     
-    // Multiplexores de entrada controlados por la FSM
-    reg [W-1:0] alu_add_A, alu_add_B;
-    reg [W-1:0] alu_sub_A, alu_sub_B;
-    
-    // Cables de salida
-    wire [W-1:0] res_add, res_sub;
+    // Secuencia de multiplicaciones modulares
+    localparam ST_CALC_Z1SQ  = 5'd2;  // t1 = Z1^2
+    localparam ST_CALC_Z2SQ  = 5'd3;  // t2 = Z2^2
+    localparam ST_CALC_U1    = 5'd4;  // U1 = X1 * Z2^2
+    localparam ST_CALC_U2    = 5'd5;  // U2 = X2 * Z1^2
+    localparam ST_CALC_Z2CU  = 5'd6;  // t3 = Z2^3
+    localparam ST_CALC_Z1CU  = 5'd7;  // t4 = Z1^3
+    localparam ST_CALC_S1    = 5'd8;  // S1 = Y1 * Z2^3
+    localparam ST_CALC_S2    = 5'd9;  // S2 = Y2 * Z1^3
+    localparam ST_CHECK_EQ   = 5'd10; // H = U2 - U1, R = S2 - S1
+    localparam ST_CALC_HSQ   = 5'd11; // H2 = H^2
+    localparam ST_CALC_HCU   = 5'd12; // H3 = H^3
+    localparam ST_CALC_V     = 5'd13; // V  = U1 * H^2
+    localparam ST_CALC_RSQ   = 5'd14; // R2 = R^2
+    localparam ST_CALC_X3    = 5'd15; // X3 = R^2 - H^3 - 2V
+    localparam ST_CALC_Y3_A  = 5'd16; // t5 = R * (V - X3)
+    localparam ST_CALC_Y3_B  = 5'd17; // t6 = S1 * H^3
+    localparam ST_CALC_Z3_A  = 5'd18; // t7 = Z1 * Z2
+    localparam ST_CALC_Z3_B  = 5'd19; // Z3 = t7 * H
 
-    // Instancia ÚNICA del sumador
-    mod_add #(256) u_mod_add (
-        .clk(clk), .rst_n(rst_n), .start(start_add),
-        .A(alu_add_A), .B(alu_add_B), .P(P_MOD),
-        .res(res_add), .done(done_add)
-    );
+    localparam ST_MULT_WAIT  = 5'd20;
+    localparam ST_DONE       = 5'd21;
 
-    // Instancia ÚNICA del restador
-    mod_sub #(256) u_mod_sub (
-        .clk(clk), .rst_n(rst_n), .start(start_sub),
-        .A(alu_sub_A), .B(alu_sub_B), .P(P_MOD),
-        .res(res_sub), .done(done_sub)
-    );
+    reg [4:0] state, next_state;
 
-    // 4. MÁQUINA DE ESTADOS FINITOS (Actualizada a 6 bits para soportar más de 31 estados)
-    reg [5:0] state;
-    
-    // Estados Iniciales
-    localparam S_IDLE    = 6'd0;
-    localparam S_Z2_SQR  = 6'd1;  
-    localparam S_WAIT_1  = 6'd2;
-    localparam S_Z1_SQR  = 6'd3;  
-    localparam S_WAIT_2  = 6'd4;
-    localparam S_U1      = 6'd5;  
-    localparam S_WAIT_3  = 6'd6;
-    localparam S_U2      = 6'd7;  
-    localparam S_WAIT_4  = 6'd8;
-    localparam S_CALC_H  = 6'd9;  
-    
-    // Estados Nuevos
-    localparam S_Z2_CUBE = 6'd10;
-    localparam S_WAIT_5  = 6'd11;
-    localparam S_Z1_CUBE = 6'd12;
-    localparam S_WAIT_6  = 6'd13;
-    localparam S_S1      = 6'd14;
-    localparam S_WAIT_7  = 6'd15;
-    localparam S_S2      = 6'd16;
-    localparam S_WAIT_8  = 6'd17;
-    localparam S_CALC_R  = 6'd18;
-    localparam S_H_SQR   = 6'd19;
-    localparam S_WAIT_9  = 6'd20;
-    localparam S_H_CUBE  = 6'd21;
-    localparam S_WAIT_10 = 6'd22;
-    localparam S_U1_H2   = 6'd23;
-    localparam S_WAIT_11 = 6'd24;
-    localparam S_R_SQR   = 6'd25;
-    localparam S_WAIT_12 = 6'd26;
-    
-    localparam S_X3_1    = 6'd27;
-    localparam S_X3_2    = 6'd28;
-    localparam S_X3_3    = 6'd29;
-    
-    localparam S_Y3_1    = 6'd30;
-    localparam S_Y3_MUL1 = 6'd31;
-    localparam S_WAIT_13 = 6'd32;
-    localparam S_Y3_MUL2 = 6'd33;
-    localparam S_WAIT_14 = 6'd34;
-    localparam S_Y3_2    = 6'd35;
-    
-    localparam S_Z3_MUL1 = 6'd36;
-    localparam S_WAIT_15 = 6'd37;
-    localparam S_Z3_MUL2 = 6'd38;
-    localparam S_WAIT_16 = 6'd39;
+    // ------------------------------------------------------------------------
+    // Registros temporales de cálculo
+    // ------------------------------------------------------------------------
+    reg [WIDTH-1:0] z1_sq, z2_sq;
+    reg [WIDTH-1:0] u1, u2;
+    reg [WIDTH-1:0] s1, s2;
+    reg [WIDTH-1:0] h, r;
+    reg [WIDTH-1:0] h_sq, h_cu;
+    reg [WIDTH-1:0] v;
+    reg [WIDTH-1:0] r_sq;
+    reg [WIDTH-1:0] t_y3a, t_y3b, t_z3a;
 
-    localparam S_DONE    = 6'd63;
-
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state <= S_IDLE;
-            mult_start <= 0;
-            done <= 0;
+    // ------------------------------------------------------------------------
+    // Máquina de Estados Finita (FSM)
+    // ------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state      <= ST_IDLE;
+            next_state <= ST_IDLE;
+            done       <= 1'b0;
+            busy       <= 1'b0;
+            is_double  <= 1'b0;
+            mult_start <= 1'b0;
+            mult_a     <= {WIDTH{1'b0}};
+            mult_b     <= {WIDTH{1'b0}};
+            x3         <= {WIDTH{1'b0}};
+            y3         <= {WIDTH{1'b0}};
+            z3         <= {WIDTH{1 meb0}};
         end else begin
             case (state)
-                S_IDLE: begin
-                    done <= 0;
-                    if (start) state <= S_Z2_SQR;
-                end
 
-                // --- ETAPA 1: Calcular Z2^2 ---
-                S_Z2_SQR: begin
-                    mult_A <= Z2;      
-                    mult_B <= Z2;      
-                    mult_start <= 1;   
-                    state <= S_WAIT_1;
-                end
-                S_WAIT_1: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T1 <= mult_out; 
-                        state <= S_Z1_SQR;
+                ST_IDLE: begin
+                    done      <= 1'b0;
+                    is_double <= 1'b0;
+                    if (start) begin
+                        busy  <= 1'b1;
+                        state <= ST_CHECK_ZERO;
+                    end else begin
+                        busy  <= 1'b0;
                     end
                 end
 
-                // --- ETAPA 2: Calcular Z1^2 ---
-                S_Z1_SQR: begin
-                    mult_A <= Z1;
-                    mult_B <= Z1;
-                    mult_start <= 1;
-                    state <= S_WAIT_2;
-                end
-                S_WAIT_2: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T2 <= mult_out;
-                        state <= S_U1;
+                // ------------------------------------------------------------
+                // Casos límite de puntos en el infinito (Z = 0)
+                // ------------------------------------------------------------
+                ST_CHECK_ZERO: begin
+                    if (z1 == {WIDTH{1'b0}}) begin
+                        x3    <= x2; y3 <= y2; z3 <= z2;
+                        state <= ST_DONE;
+                    end else if (z2 == {WIDTH{1'b0}}) begin
+                        x3    <= x1; y3 <= y1; z3 <= z1;
+                        state <= ST_DONE;
+                    end else begin
+                        // Iniciar cálculo: t1 = Z1^2
+                        mult_a     <= z1;
+                        mult_b     <= z1;
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_Z1SQ;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 3: Calcular U1 = X1 * Z2^2 ---
-                S_U1: begin
-                    mult_A <= X1;
-                    mult_B <= T1;       
-                    mult_start <= 1;
-                    state <= S_WAIT_3;
+                // 1. Z1^2
+                ST_CALC_Z1SQ: begin
+                    z1_sq      <= mult_result;
+                    mult_a     <= z2;
+                    mult_b     <= z2;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z2SQ;
+                    state      <= ST_MULT_WAIT;
                 end
-                S_WAIT_3: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        U1 <= mult_out; 
-                        state <= S_U2;
+
+                // 2. Z2^2
+                ST_CALC_Z2SQ: begin
+                    z2_sq      <= mult_result;
+                    mult_a     <= x1;
+                    mult_b     <= mult_result; // Z2^2
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_U1;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 3. U1 = X1 * Z2^2
+                ST_CALC_U1: begin
+                    u1         <= mult_result;
+                    mult_a     <= x2;
+                    mult_b     <= z1_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_U2;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 4. U2 = X2 * Z1^2
+                ST_CALC_U2: begin
+                    u2         <= mult_result;
+                    mult_a     <= z2;
+                    mult_b     <= z2_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z2CU;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 5. Z2^3 = Z2 * Z2^2
+                ST_CALC_Z2CU: begin
+                    mult_a     <= z1;
+                    mult_b     <= z1_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z1CU;
+                    state      <= ST_MULT_WAIT;
+                    z2_sq      <= mult_result; // Guardar Z2^3 en z2_sq temporalmente
+                end
+
+                // 6. Z1^3 = Z1 * Z1^2
+                ST_CALC_Z1CU: begin
+                    mult_a     <= y1;
+                    mult_b     <= z2_sq; // Z2^3
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_S1;
+                    state      <= ST_MULT_WAIT;
+                    z1_sq      <= mult_result; // Guardar Z1^3 en z1_sq temporalmente
+                end
+
+                // 7. S1 = Y1 * Z2^3
+                ST_CALC_S1: begin
+                    s1         <= mult_result;
+                    mult_a     <= y2;
+                    mult_b     <= z1_sq; // Z1^3
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_S2;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 8. S2 = Y2 * Z1^3
+                ST_CALC_S2: begin
+                    s2    <= mult_result;
+                    state <= ST_CHECK_EQ;
+                end
+
+                // ------------------------------------------------------------
+                // Comprobar H = U2 - U1, R = S2 - S1
+                // ------------------------------------------------------------
+                ST_CHECK_EQ: begin
+                    h <= mod_sub(u2, u1, p);
+                    r <= mod_sub(s2, s1, p);
+
+                    if (u1 == u2) begin
+                        if (s1 == s2) begin
+                            // P1 == P2: se debe llamar a Point Double
+                            is_double <= 1'b1;
+                            state     <= ST_DONE;
+                        end else begin
+                            // P1 == -P2: El resultado es el punto al infinito (0,0,0)
+                            x3 <= {WIDTH{1'b0}};
+                            y3 <= {WIDTH{1 meb0}};
+                            z3 <= {WIDTH{1'b0}};
+                            state <= ST_DONE;
+                        end
+                    end else begin
+                        // H^2 = H * H
+                        mult_a     <= mod_sub(u2, u1, p);
+                        mult_b     <= mod_sub(u2, u1, p);
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_HSQ;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 4: Calcular U2 = X2 * Z1^2 ---
-                S_U2: begin
-                    mult_A <= X2;
-                    mult_B <= T2;       
-                    mult_start <= 1;
-                    state <= S_WAIT_4;
+                // 9. H^2
+                ST_CALC_HSQ: begin
+                    h_sq       <= mult_result;
+                    mult_a     <= h;
+                    mult_b     <= mult_result;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_HCU;
+                    state      <= ST_MULT_WAIT;
                 end
-                S_WAIT_4: begin
-                    mult_start <= 0;
+
+                // 10. H^3 = H * H^2
+                ST_CALC_HCU: begin
+                    h_cu       <= mult_result;
+                    mult_a     <= u1;
+                    mult_b     <= h_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_V;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 11. V = U1 * H^2
+                ST_CALC_V: begin
+                    v          <= mult_result;
+                    mult_a     <= r;
+                    mult_b     <= r;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_RSQ;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 12. R^2
+                ST_CALC_RSQ: begin
+                    r_sq  <= mult_result;
+                    state <= ST_CALC_X3;
+                end
+
+                // 13. X3 = R^2 - H^3 - 2V
+                ST_CALC_X3: begin
+                    begin
+                        reg [WIDTH-1:0] temp_v2;
+                        reg [WIDTH-1:0] temp_sub1;
+                        temp_v2   = mod_add(v, v, p); // 2V
+                        temp_sub1 = mod_sub(r_sq, h_cu, p); // R^2 - H^3
+                        x3        <= mod_sub(temp_sub1, temp_v2, p);
+                    end
+
+                    // t5 = R * (V - X3)
+                    mult_a     <= r;
+                    mult_b     <= mod_sub(v, mod_sub(mod_sub(r_sq, h_cu, p), mod_add(v, v, p), p), p);
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Y3_A;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 14. t5 = R * (V - X3)
+                ST_CALC_Y3_A: begin
+                    t_y3a      <= mult_result;
+                    mult_a     <= s1;
+                    mult_b     <= h_cu;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Y3_B;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 15. t6 = S1 * H^3  ==>  Y3 = t5 - t6
+                ST_CALC_Y3_B: begin
+                    t_y3b <= mult_result;
+                    y3    <= mod_sub(t_y3a, mult_result, p);
+
+                    // t7 = Z1 * Z2
+                    mult_a     <= z1;
+                    mult_b     <= z2;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z3_A;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 16. t7 = Z1 * Z2
+                ST_CALC_Z3_A: begin
+                    t_z3a      <= mult_result;
+                    mult_a     <= mult_result;
+                    mult_b     <= h;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z3_B;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 17. Z3 = t7 * H
+                ST_CALC_Z3_B: begin
+                    z3    <= mult_result;
+                    state <= ST_DONE;
+                end
+
+                // Sub-rutina de espera del multiplicador de Montgomery
+                ST_MULT_WAIT: begin
+                    mult_start <= 1'b0;
                     if (mult_done) begin
-                        U2 <= mult_out; 
-                        state <= S_CALC_H;
+                        state <= next_state;
                     end
                 end
 
-                // --- ETAPA 5: Calcular H = U2 - U1 ---
-                S_CALC_H: begin
-                    mult_A <= U2;
-                    mult_B <= U1;
-                    H <= mod_sub_res;   
-                    state <= S_Z2_CUBE;
+                ST_DONE: begin
+                    done  <= 1'b1;
+                    busy  <= 1'b0;
+                    state <= ST_IDLE;
                 end
 
-                // --- ETAPA 6: Calcular Z2^3 = Z2^2 * Z2 ---
-                S_Z2_CUBE: begin
-                    mult_A <= T1; // T1 = Z2^2
-                    mult_B <= Z2;
-                    mult_start <= 1;
-                    state <= S_WAIT_5;
-                end
-                S_WAIT_5: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T3 <= mult_out; // T3 = Z2^3
-                        state <= S_Z1_CUBE;
-                    end
-                end
-
-                // --- ETAPA 7: Calcular Z1^3 = Z1^2 * Z1 ---
-                S_Z1_CUBE: begin
-                    mult_A <= T2; // T2 = Z1^2
-                    mult_B <= Z1;
-                    mult_start <= 1;
-                    state <= S_WAIT_6;
-                end
-                S_WAIT_6: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T4 <= mult_out; // T4 = Z1^3
-                        state <= S_S1;
-                    end
-                end
-
-                // --- ETAPA 8: Calcular S1 = Y1 * Z2^3 ---
-                S_S1: begin
-                    mult_A <= Y1;
-                    mult_B <= T3;
-                    mult_start <= 1;
-                    state <= S_WAIT_7;
-                end
-                S_WAIT_7: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        S1 <= mult_out;
-                        state <= S_S2;
-                    end
-                end
-
-                // --- ETAPA 9: Calcular S2 = Y2 * Z1^3 ---
-                S_S2: begin
-                    mult_A <= Y2;
-                    mult_B <= T4;
-                    mult_start <= 1;
-                    state <= S_WAIT_8;
-                end
-                S_WAIT_8: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        S2 <= mult_out;
-                        state <= S_CALC_R;
-                    end
-                end
-
-                // --- ETAPA 10: Calcular R = S2 - S1 ---
-                S_CALC_R: begin
-                    mult_A <= S2;
-                    mult_B <= S1;
-                    R <= mod_sub_res;
-                    state <= S_H_SQR;
-                end
-
-                // --- ETAPA 11: Calcular H^2 ---
-                S_H_SQR: begin
-                    mult_A <= H;
-                    mult_B <= H;
-                    mult_start <= 1;
-                    state <= S_WAIT_9;
-                end
-                S_WAIT_9: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T1 <= mult_out; // Sobrescribe T1 con H^2
-                        state <= S_H_CUBE;
-                    end
-                end
-
-                // --- ETAPA 12: Calcular H^3 = H^2 * H ---
-                S_H_CUBE: begin
-                    mult_A <= T1;
-                    mult_B <= H;
-                    mult_start <= 1;
-                    state <= S_WAIT_10;
-                end
-                S_WAIT_10: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T2 <= mult_out; // Sobrescribe T2 con H^3
-                        state <= S_U1_H2;
-                    end
-                end
-
-                // --- ETAPA 13: Calcular U1 * H^2 ---
-                S_U1_H2: begin
-                    mult_A <= U1;
-                    mult_B <= T1; // H^2
-                    mult_start <= 1;
-                    state <= S_WAIT_11;
-                end
-                S_WAIT_11: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T3 <= mult_out; // Sobrescribe T3 con U1*H^2
-                        state <= S_R_SQR;
-                    end
-                end
-
-                // --- ETAPA 14: Calcular R^2 ---
-                S_R_SQR: begin
-                    mult_A <= R;
-                    mult_B <= R;
-                    mult_start <= 1;
-                    state <= S_WAIT_12;
-                end
-                S_WAIT_12: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T4 <= mult_out; // Sobrescribe T4 con R^2
-                        state <= S_X3_1;
-                    end
-                end
-
-                // --- ETAPA 15: Calcular X3 = R^2 - H^3 - 2*U1*H^2 ---
-                S_X3_1: begin
-                    mult_A <= T4; // R^2
-                    mult_B <= T2; // H^3
-                    U2 <= mod_sub_res; // Reutilizamos U2 para (R^2 - H^3)
-                    state <= S_X3_2;
-                end
-                S_X3_2: begin
-                    mult_A <= T3; // U1*H^2
-                    mult_B <= T3; // U1*H^2
-                    T4 <= mod_add_res; // Reutilizamos T4 para (2 * U1*H^2)
-                    state <= S_X3_3;
-                end
-                S_X3_3: begin
-                    mult_A <= U2; // R^2 - H^3
-                    mult_B <= T4; // 2*U1*H^2
-                    X3 <= mod_sub_res; // << X3 COMPLETADO >>
-                    state <= S_Y3_1;
-                end
-
-                // --- ETAPA 16: Calcular Y3 = R*(U1*H^2 - X3) - S1*H^3 ---
-                S_Y3_1: begin
-                    mult_A <= T3; // U1*H^2
-                    mult_B <= X3;
-                    T3 <= mod_sub_res; // T3 pasa a ser (U1*H^2 - X3)
-                    state <= S_Y3_MUL1;
-                end
-                S_Y3_MUL1: begin
-                    mult_A <= R;
-                    mult_B <= T3; // (U1*H^2 - X3)
-                    mult_start <= 1;
-                    state <= S_WAIT_13;
-                end
-                S_WAIT_13: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T4 <= mult_out; // T4 = R*(U1*H^2 - X3)
-                        state <= S_Y3_MUL2;
-                    end
-                end
-                S_Y3_MUL2: begin
-                    mult_A <= S1;
-                    mult_B <= T2; // H^3
-                    mult_start <= 1;
-                    state <= S_WAIT_14;
-                end
-                S_WAIT_14: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        U2 <= mult_out; // U2 = S1*H^3
-                        state <= S_Y3_2;
-                    end
-                end
-                S_Y3_2: begin
-                    mult_A <= T4; // R*(U1*H^2 - X3)
-                    mult_B <= U2; // S1*H^3
-                    Y3 <= mod_sub_res; // << Y3 COMPLETADO >>
-                    state <= S_Z3_MUL1;
-                end
-
-                // --- ETAPA 17: Calcular Z3 = H * Z1 * Z2 ---
-                S_Z3_MUL1: begin
-                    mult_A <= Z1;
-                    mult_B <= Z2;
-                    mult_start <= 1;
-                    state <= S_WAIT_15;
-                end
-                S_WAIT_15: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T1 <= mult_out; // T1 = Z1*Z2
-                        state <= S_Z3_MUL2;
-                    end
-                end
-                S_Z3_MUL2: begin
-                    mult_A <= H;
-                    mult_B <= T1; // Z1*Z2
-                    mult_start <= 1;
-                    state <= S_WAIT_16;
-                end
-                S_WAIT_16: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        Z3 <= mult_out; // << Z3 COMPLETADO >>
-                        state <= S_DONE;
-                    end
-                end
-
-                S_DONE: begin
-                    done <= 1;
-                    state <= S_IDLE;
-                end
+                default: state <= ST_IDLE;
             endcase
         end
     end

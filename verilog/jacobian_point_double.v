@@ -1,299 +1,300 @@
-`timescale 1ns / 1ps
-
 // ============================================================================
-// MÓDULO: Doblado de Punto Jacobiano (2P)
-// OBJETIVO: Optimización para secp256k1 (a=0) mediante "Resource Sharing"
+// Módulo: jacobian_point_double.v (Genérico / Curve-Agnostic)
+// Operación: P3 (X3, Y3, Z3) = 2 * P1 (X1, Y1, Z1)
+// Coordenadas: Jacobianas (x = X/Z^2, y = Y/Z^3)
+// Optimizado para: Intel Cyclone IV (Reutiliza el Multiplicador de Montgomery)
 // ============================================================================
 
 module jacobian_point_double #(
-    parameter W = 256
+    parameter WIDTH = 256
 )(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,
-    
-    // Punto P
-    input  wire [W-1:0] X1, Y1, Z1,
-    // Módulo de la curva
-    input  wire [W-1:0] P_MOD,
-    
-    // Resultado Punto R = 2P
-    output reg  [W-1:0] X3, Y3, Z3,
-    output reg          done
+    input  wire                 clk,
+    input  wire                 rst_n,
+
+    // Control
+    input  wire                 start,
+    output reg                  done,
+    output reg                  busy,
+
+    // Entradas P1, Coeficiente 'a' y Módulo P (en dominio Montgomery)
+    input  wire [WIDTH-1:0]     x1, y1, z1,
+    input  wire [WIDTH-1:0]     a_param, // Coeficiente 'a' de la curva (0 para secp256k1)
+    input  wire [WIDTH-1:0]     p,
+
+    // Salidas P3
+    output reg  [WIDTH-1:0]     x3, y3, z3,
+
+    // Interfaz con el Multiplicador de Montgomery compartido
+    output reg                  mult_start,
+    output reg  [WIDTH-1:0]     mult_a,
+    output reg  [WIDTH-1:0]     mult_b,
+    input  wire                 mult_done,
+    input  wire [WIDTH-1:0]     mult_result
 );
 
-    // 1. REGISTROS INTERNOS TEMPORALES
-    reg [W-1:0] T1, T2, T3, T4;
+    // ------------------------------------------------------------------------
+    // Funciones Modulares Auxiliares (Aritmética combinacional)
+    // ------------------------------------------------------------------------
+    function [WIDTH-1:0] mod_add;
+        input [WIDTH-1:0] a, b, mod;
+        reg [WIDTH:0] sum;
+        begin
+            sum = a + b;
+            mod_add = (sum >= mod) ? (sum - mod) : sum[WIDTH-1:0];
+        end
+    endfunction
 
-    // 2. INTERFAZ DEL MULTIPLICADOR ÚNICO
-    reg          mult_start;
-    reg  [W-1:0] mult_A;
-    reg  [W-1:0] mult_B;
-    wire [W-1:0] mult_out;
-    wire         mult_done;
+    function [WIDTH-1:0] mod_sub;
+        input [WIDTH-1:0] a, b, mod;
+        begin
+            mod_sub = (a >= b) ? (a - b) : (a + mod - b);
+        end
+    endfunction
 
-    montgomery_multiplier #(.W(W)) u_mult (
-        .clk(clk),
-        .rst(rst),
-        .start(mult_start),
-        .A(mult_A),
-        .B(mult_B),
-        .P(P_MOD),
-        .S_out(mult_out),
-        .done(mult_done)
-    );
+    // ------------------------------------------------------------------------
+    // Codificación de Estados
+    // ------------------------------------------------------------------------
+    localparam ST_IDLE       = 4'd0;
+    localparam ST_CHECK_ZERO = 4'd1;
+    localparam ST_CALC_Y1SQ  = 4'd2;  // T1 = Y1^2
+    localparam ST_CALC_X1SQ  = 4'd3;  // T2 = X1^2
+    localparam ST_CALC_S_RAW = 4'd4;  // t_s = X1 * Y1^2
+    localparam ST_CALC_Y1CU  = 4'd5;  // T3 = Y1^4
+    localparam ST_CHECK_A    = 4'd6;  // Evaluar a_param
+    localparam ST_CALC_Z1SQ  = 4'd7;  // Z1^2 (Si a != 0)
+    localparam ST_CALC_Z1QU  = 4'd8;  // Z1^4 (Si a != 0)
+    localparam ST_CALC_AZ1QU = 4'd9;  // a * Z1^4 (Si a != 0)
+    localparam ST_CALC_M_SQ  = 4'd10; // M^2 = M * M
+    localparam ST_CALC_Y3_RAW= 4'd11; // t_y = M * (S - X3)
+    localparam ST_CALC_Z3_RAW= 4'd12; // t_z = Y1 * Z1
+    localparam ST_MULT_WAIT  = 4'd13;
+    localparam ST_DONE       = 4'd14;
 
-    // 3. ALU COMBINACIONAL (Sumas, restas y multiplicaciones por 2)
-    wire [W:0] sum_val = mult_A + mult_B; 
-    wire [W-1:0] mod_add_res = (sum_val >= P_MOD) ? (sum_val - P_MOD) : sum_val;
-    wire [W-1:0] mod_sub_res = (mult_A >= mult_B) ? (mult_A - mult_B) : (mult_A + P_MOD - mult_B);
+    reg [3:0] state, next_state;
 
-    // 4. MÁQUINA DE ESTADOS FINITOS (6 bits)
-    reg [5:0] state;
-    
-    localparam S_IDLE       = 6'd0;
-    
-    localparam S_T1_SQR     = 6'd1;
-    localparam S_WAIT_1     = 6'd2;
-    localparam S_T2_SQR     = 6'd3;
-    localparam S_WAIT_2     = 6'd4;
-    localparam S_T3_MUL     = 6'd5;
-    localparam S_WAIT_3     = 6'd6;
-    
-    localparam S_M_ADD1     = 6'd7;
-    localparam S_M_ADD2     = 6'd8;
-    localparam S_S_ADD1     = 6'd9;
-    localparam S_S_ADD2     = 6'd10;
-    
-    localparam S_M_SQR      = 6'd11;
-    localparam S_WAIT_4     = 6'd12;
-    localparam S_X3_CALC1   = 6'd13;
-    localparam S_X3_CALC2   = 6'd14;
-    
-    localparam S_T4_SQR     = 6'd15;
-    localparam S_WAIT_5     = 6'd16;
-    localparam S_U_ADD1     = 6'd17;
-    localparam S_U_ADD2     = 6'd18;
-    localparam S_U_ADD3     = 6'd19;
-    
-    localparam S_Y3_SUB1    = 6'd20;
-    localparam S_Y3_MUL     = 6'd21;
-    localparam S_WAIT_6     = 6'd22;
-    localparam S_Y3_CALC    = 6'd23;
-    
-    localparam S_Z3_MUL     = 6'd24;
-    localparam S_WAIT_7     = 6'd25;
-    localparam S_Z3_CALC    = 6'd26;
-    
-    localparam S_DONE       = 6'd63;
+    // ------------------------------------------------------------------------
+    // Registros temporales de cálculo
+    // ------------------------------------------------------------------------
+    reg [WIDTH-1:0] y1_sq;
+    reg [WIDTH-1:0] x1_sq;
+    reg [WIDTH-1:0] s;       // S = 4 * X1 * Y1^2
+    reg [WIDTH-1:0] c;       // C = 8 * Y1^4
+    reg [WIDTH-1:0] z1_sq;
+    reg [WIDTH-1:0] z1_qu;
+    reg [WIDTH-1:0] m;       // M = 3 * X1^2 + a * Z1^4
+    reg [WIDTH-1:0] t_y3;
 
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state <= S_IDLE;
-            mult_start <= 0;
-            done <= 0;
+    // ------------------------------------------------------------------------
+    // Máquina de Estados Finita (FSM)
+    // ------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state      <= ST_IDLE;
+            next_state <= ST_IDLE;
+            done       <= 1'b0;
+            busy       <= 1'b0;
+            mult_start <= 1'b0;
+            mult_a     <= {WIDTH{1'b0}};
+            mult_b     <= {WIDTH{1'b0}};
+            x3         <= {WIDTH{1'b0}};
+            y3         <= {WIDTH{1'b0}};
+            z3         <= {WIDTH{1'b0}};
+            y1_sq      <= {WIDTH{1'b0}};
+            x1_sq      <= {WIDTH{1'b0}};
+            s          <= {WIDTH{1'b0}};
+            c          <= {WIDTH{1'b0}};
+            z1_sq      <= {WIDTH{1'b0}};
+            z1_qu      <= {WIDTH{1'b0}};
+            m          <= {WIDTH{1'b0}};
+            t_y3       <= {WIDTH{1'b0}};
         end else begin
             case (state)
-                S_IDLE: begin
-                    done <= 0;
-                    if (start) state <= S_T1_SQR;
-                end
 
-                // --- ETAPA 1: T1 = X1^2 ---
-                S_T1_SQR: begin
-                    mult_A <= X1;      
-                    mult_B <= X1;      
-                    mult_start <= 1;   
-                    state <= S_WAIT_1;
-                end
-                S_WAIT_1: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T1 <= mult_out; 
-                        state <= S_T2_SQR;
+                ST_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        busy  <= 1'b1;
+                        state <= ST_CHECK_ZERO;
+                    end else begin
+                        busy  <= 1'b0;
                     end
                 end
 
-                // --- ETAPA 2: T2 = Y1^2 ---
-                S_T2_SQR: begin
-                    mult_A <= Y1;
-                    mult_B <= Y1;
-                    mult_start <= 1;
-                    state <= S_WAIT_2;
-                end
-                S_WAIT_2: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T2 <= mult_out;
-                        state <= S_T3_MUL;
+                // ------------------------------------------------------------
+                // Casos límite: Punto al infinito (Z = 0 o Y = 0)
+                // ------------------------------------------------------------
+                ST_CHECK_ZERO: begin
+                    if (z1 == {WIDTH{1'b0}} || y1 == {WIDTH{1'b0}}) begin
+                        x3    <= {WIDTH{1'b0}};
+                        y3    <= {WIDTH{1'b0}};
+                        z3    <= {WIDTH{1'b0}};
+                        state <= ST_DONE;
+                    end else begin
+                        // 1. T1 = Y1^2
+                        mult_a     <= y1;
+                        mult_b     <= y1;
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_Y1SQ;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 3: T3 = X1 * Y1^2 ---
-                S_T3_MUL: begin
-                    mult_A <= X1;
-                    mult_B <= T2; // Y1^2      
-                    mult_start <= 1;
-                    state <= S_WAIT_3;
+                // 1. T1 = Y1^2
+                ST_CALC_Y1SQ: begin
+                    y1_sq      <= mult_result;
+                    // 2. T2 = X1^2
+                    mult_a     <= x1;
+                    mult_b     <= x1;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_X1SQ;
+                    state      <= ST_MULT_WAIT;
                 end
-                S_WAIT_3: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T3 <= mult_out; 
-                        state <= S_M_ADD1;
+
+                // 2. T2 = X1^2
+                ST_CALC_X1SQ: begin
+                    x1_sq      <= mult_result;
+                    // 3. t_s = X1 * Y1^2
+                    mult_a     <= x1;
+                    mult_b     <= y1_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_S_RAW;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 3. S = 4 * X1 * Y1^2
+                ST_CALC_S_RAW: begin
+                    begin
+                        reg [WIDTH-1:0] s_x2;
+                        s_x2 = mod_add(mult_result, mult_result, p); // 2 * t_s
+                        s    <= mod_add(s_x2, s_x2, p);              // 4 * t_s
+                    end
+                    // 4. T3 = Y1^4
+                    mult_a     <= y1_sq;
+                    mult_b     <= y1_sq;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Y1CU;
+                    state      <= ST_MULT_WAIT;
+                end
+
+                // 4. C = 8 * Y1^4
+                ST_CALC_Y1CU: begin
+                    begin
+                        reg [WIDTH-1:0] c_x2, c_x4;
+                        c_x2 = mod_add(mult_result, mult_result, p); // 2 * Y1^4
+                        c_x4 = mod_add(c_x2, c_x2, p);              // 4 * Y1^4
+                        c    <= mod_add(c_x4, c_x4, p);              // 8 * Y1^4
+                    end
+                    state <= ST_CHECK_A;
+                end
+
+                // ------------------------------------------------------------
+                // Cálculo de M = 3 * X1^2 + a * Z1^4
+                // ------------------------------------------------------------
+                ST_CHECK_A: begin
+                    if (a_param == {WIDTH{1'b0}}) begin
+                        // Caso a = 0 (secp256k1): M = 3 * X1^2
+                        m <= mod_add(mod_add(x1_sq, x1_sq, p), x1_sq, p);
+                        
+                        // M^2
+                        mult_a     <= mod_add(mod_add(x1_sq, x1_sq, p), x1_sq, p);
+                        mult_b     <= mod_add(mod_add(x1_sq, x1_sq, p), x1_sq, p);
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_M_SQ;
+                        state      <= ST_MULT_WAIT;
+                    end else begin
+                        // Caso a != 0: Z1^2
+                        mult_a     <= z1;
+                        mult_b     <= z1;
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_Z1SQ;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 4: M = 3 * X1^2 (Combinacional) ---
-                S_M_ADD1: begin
-                    mult_A <= T1;
-                    mult_B <= T1;
-                    T4 <= mod_add_res; // T4 = 2 * X1^2
-                    state <= S_M_ADD2;
-                end
-                S_M_ADD2: begin
-                    mult_A <= T1; // X1^2
-                    mult_B <= T4; // 2 * X1^2
-                    T1 <= mod_add_res; // Sobrescribe T1 -> M = 3 * X1^2
-                    state <= S_S_ADD1;
+                // Si a != 0: Z1^2
+                ST_CALC_Z1SQ: begin
+                    z1_sq      <= mult_result;
+                    mult_a     <= mult_result;
+                    mult_b     <= mult_result;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z1QU;
+                    state      <= ST_MULT_WAIT;
                 end
 
-                // --- ETAPA 5: S = 4 * X1 * Y1^2 (Combinacional) ---
-                S_S_ADD1: begin
-                    mult_A <= T3;
-                    mult_B <= T3;
-                    T4 <= mod_add_res; // T4 = 2 * (X1 * Y1^2)
-                    state <= S_S_ADD2;
-                end
-                S_S_ADD2: begin
-                    mult_A <= T4;
-                    mult_B <= T4;
-                    T3 <= mod_add_res; // Sobrescribe T3 -> S = 4 * (X1 * Y1^2)
-                    state <= S_M_SQR;
+                // Si a != 0: Z1^4
+                ST_CALC_Z1QU: begin
+                    z1_qu      <= mult_result;
+                    mult_a     <= a_param;
+                    mult_b     <= mult_result;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_AZ1QU;
+                    state      <= ST_MULT_WAIT;
                 end
 
-                // --- ETAPA 6: M^2 ---
-                S_M_SQR: begin
-                    mult_A <= T1; // M
-                    mult_B <= T1; // M
-                    mult_start <= 1;
-                    state <= S_WAIT_4;
-                end
-                S_WAIT_4: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T4 <= mult_out; // T4 = M^2
-                        state <= S_X3_CALC1;
+                // Si a != 0: a * Z1^4  ==> M = 3 * X1^2 + a * Z1^4
+                ST_CALC_AZ1QU: begin
+                    begin
+                        reg [WIDTH-1:0] x1_sq_3;
+                        x1_sq_3 = mod_add(mod_add(x1_sq, x1_sq, p), x1_sq, p);
+                        m       <= mod_add(x1_sq_3, mult_result, p);
+                        
+                        mult_a     <= mod_add(x1_sq_3, mult_result, p);
+                        mult_b     <= mod_add(x1_sq_3, mult_result, p);
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_M_SQ;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 7: X3 = M^2 - 2S ---
-                S_X3_CALC1: begin
-                    mult_A <= T3; // S
-                    mult_B <= T3; // S
-                    X3 <= mod_add_res; // Temporalmente usamos X3 para 2S (ahorra área)
-                    state <= S_X3_CALC2;
-                end
-                S_X3_CALC2: begin
-                    mult_A <= T4; // M^2
-                    mult_B <= X3; // 2S
-                    X3 <= mod_sub_res; // << X3 COMPLETADO >>
-                    state <= S_T4_SQR;
-                end
-
-                // --- ETAPA 8: Y1^4 = (Y1^2)^2 ---
-                S_T4_SQR: begin
-                    mult_A <= T2; // Y1^2
-                    mult_B <= T2; // Y1^2
-                    mult_start <= 1;
-                    state <= S_WAIT_5;
-                end
-                S_WAIT_5: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T2 <= mult_out; // Sobrescribe T2 con Y1^4
-                        state <= S_U_ADD1;
+                // 5. X3 = M^2 - 2*S
+                ST_CALC_M_SQ: begin
+                    begin
+                        reg [WIDTH-1:0] s_x2;
+                        s_x2 = mod_add(s, s, p);
+                        x3   <= mod_sub(mult_result, s_x2, p);
+                        
+                        // t_y = M * (S - X3)
+                        mult_a     <= m;
+                        mult_b     <= mod_sub(s, mod_sub(mult_result, s_x2, p), p);
+                        mult_start <= 1'b1;
+                        next_state <= ST_CALC_Y3_RAW;
+                        state      <= ST_MULT_WAIT;
                     end
                 end
 
-                // --- ETAPA 9: U = 8 * Y1^4 (Combinacional) ---
-                S_U_ADD1: begin
-                    mult_A <= T2;
-                    mult_B <= T2;
-                    T4 <= mod_add_res; // T4 = 2 * Y1^4
-                    state <= S_U_ADD2;
-                end
-                S_U_ADD2: begin
-                    mult_A <= T4;
-                    mult_B <= T4;
-                    T2 <= mod_add_res; // T2 = 4 * Y1^4
-                    state <= S_U_ADD3;
-                end
-                S_U_ADD3: begin
-                    mult_A <= T2;
-                    mult_B <= T2;
-                    T2 <= mod_add_res; // Sobrescribe T2 -> U = 8 * Y1^4
-                    state <= S_Y3_SUB1;
+                // 6. Y3 = M * (S - X3) - C
+                ST_CALC_Y3_RAW: begin
+                    y3 <= mod_sub(mult_result, c, p);
+                    
+                    // 7. Z3 = 2 * Y1 * Z1
+                    mult_a     <= y1;
+                    mult_b     <= z1;
+                    mult_start <= 1'b1;
+                    next_state <= ST_CALC_Z3_RAW;
+                    state      <= ST_MULT_WAIT;
                 end
 
-                // --- ETAPA 10: S - X3 ---
-                S_Y3_SUB1: begin
-                    mult_A <= T3; // S
-                    mult_B <= X3; 
-                    T4 <= mod_sub_res; // T4 = (S - X3)
-                    state <= S_Y3_MUL;
+                // 7. Z3 = 2 * (Y1 * Z1)
+                ST_CALC_Z3_RAW: begin
+                    z3    <= mod_add(mult_result, mult_result, p);
+                    state <= ST_DONE;
                 end
 
-                // --- ETAPA 11: M * (S - X3) ---
-                S_Y3_MUL: begin
-                    mult_A <= T1; // M
-                    mult_B <= T4; // (S - X3)
-                    mult_start <= 1;
-                    state <= S_WAIT_6;
-                end
-                S_WAIT_6: begin
-                    mult_start <= 0;
+                // Sub-rutina de espera del multiplicador de Montgomery
+                ST_MULT_WAIT: begin
+                    mult_start <= 1'b0;
                     if (mult_done) begin
-                        T4 <= mult_out; // T4 = M * (S - X3)
-                        state <= S_Y3_CALC;
+                        state <= next_state;
                     end
                 end
 
-                // --- ETAPA 12: Y3 = M * (S - X3) - U ---
-                S_Y3_CALC: begin
-                    mult_A <= T4; // M * (S - X3)
-                    mult_B <= T2; // U (8 * Y1^4)
-                    Y3 <= mod_sub_res; // << Y3 COMPLETADO >>
-                    state <= S_Z3_MUL;
+                ST_DONE: begin
+                    done  <= 1'b1;
+                    busy  <= 1'b0;
+                    state <= ST_IDLE;
                 end
 
-                // --- ETAPA 13: Y1 * Z1 ---
-                S_Z3_MUL: begin
-                    mult_A <= Y1; 
-                    mult_B <= Z1; 
-                    mult_start <= 1;
-                    state <= S_WAIT_7;
-                end
-                S_WAIT_7: begin
-                    mult_start <= 0;
-                    if (mult_done) begin
-                        T4 <= mult_out; 
-                        state <= S_Z3_CALC;
-                    end
-                end
-
-                // --- ETAPA 14: Z3 = 2 * Y1 * Z1 ---
-                S_Z3_CALC: begin
-                    mult_A <= T4; // Y1 * Z1
-                    mult_B <= T4; // Y1 * Z1
-                    Z3 <= mod_add_res; // << Z3 COMPLETADO >>
-                    state <= S_DONE;
-                end
-
-                S_DONE: begin
-                    done <= 1;
-                    state <= S_IDLE;
-                end
+                default: state <= ST_IDLE;
             endcase
         end
     end
