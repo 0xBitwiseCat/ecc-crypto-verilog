@@ -1,123 +1,177 @@
-`timescale 1ns / 1ps
-
 // ============================================================================
-// MÓDULO: Inversor Modular (Pequeño Teorema de Fermat)
-// OBJETIVO: Calcular Z^-1 = Z^(p-2) mod p usando Square-and-Multiply.
+// Módulo: fermat_inverter.v (Genérico / Curve-Agnostic)
+// Algoritmo: Exponenciación Binaria Left-to-Right (Square-and-Multiply)
+// Operación: Result = A^(P-2) mod P
+// Optimizado para: Intel Cyclone IV (Reutiliza el multiplicador externo)
 // ============================================================================
 
 module fermat_inverter #(
-    parameter W = 256
+    parameter WIDTH = 256
 )(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,
-    
-    // Entrada en Dominio Montgomery
-    input  wire [W-1:0] Z_in,
-    
-    // Constantes secp256k1
-    input  wire [W-1:0] R_MOD_P, // El número "1" en dominio Montgomery
-    
-    // Salida
-    output reg  [W-1:0] Z_inv,
-    output reg          done,
+    input  wire                 clk,
+    input  wire                 rst_n,
 
-    // Interfaz compartida hacia el Multiplicador de Montgomery
-    output reg          mult_start,
-    output reg  [W-1:0] mult_A, mult_B,
-    input  wire [W-1:0] mult_out,
-    input  wire         mult_done
+    // Control
+    input  wire                 start,
+    output reg                  done,
+    output reg                  busy,
+
+    // Entradas de datos (en dominio Montgomery)
+    input  wire [WIDTH-1:0]     a, // Elemento a invertir
+    input  wire [WIDTH-1:0]     p, // Primo P cualquiera de entrada
+    output reg  [WIDTH-1:0]     result,
+
+    // Interfaz con el Multiplicador de Montgomery compartido
+    output reg                  mult_start,
+    output reg  [WIDTH-1:0]     mult_a,
+    output reg  [WIDTH-1:0]     mult_b,
+    input  wire                 mult_done,
+    input  wire [WIDTH-1:0]     mult_result
 );
 
-    // ========================================================================
-    // CONSTANTE: p - 2 para secp256k1
-    // p = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2F
-    // p-2 = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE FFFFFC2D
-    // ========================================================================
-    localparam [255:0] P_MINUS_2 = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D;
+    // ------------------------------------------------------------------------
+    // Estados FSM
+    // ------------------------------------------------------------------------
+    localparam ST_IDLE      = 3'b000;
+    localparam ST_INIT      = 3'b001;
+    localparam ST_SQR_START = 3'b010;
+    localparam ST_SQR_WAIT  = 3'b011;
+    localparam ST_MUL_CHECK = 3'b100;
+    localparam ST_MUL_START = 3'b101;
+    localparam ST_MUL_WAIT  = 3'b110;
+    localparam ST_DONE      = 3'b111;
 
-    // Registros internos
-    reg [W-1:0] base_reg;
-    reg [W-1:0] result_reg;
-    reg [8:0]   bit_counter; // Cuenta de 0 a 255
-
-    // ========================================================================
-    // MÁQUINA DE ESTADOS FINITOS (FSM)
-    // ========================================================================
     reg [2:0] state;
-    
-    localparam S_IDLE       = 3'd0;
-    localparam S_CHECK_BIT  = 3'd1;
-    localparam S_MULTIPLY   = 3'd2;
-    localparam S_WAIT_MULT  = 3'd3;
-    localparam S_SQUARE     = 3'd4;
-    localparam S_WAIT_SQR   = 3'd5;
-    localparam S_DONE       = 3'd6;
 
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state <= S_IDLE;
-            mult_start <= 0;
-            done <= 0;
+    // Registros de control
+    reg [WIDTH-1:0] acc;
+    reg [WIDTH-1:0] a_reg;
+    reg [WIDTH-1:0] exponent;
+    reg [7:0]       bit_cnt;
+
+    // Exponente e = p - 2
+    wire [WIDTH-1:0] p_minus_2 = p - 2'd2;
+
+    // ------------------------------------------------------------------------
+    // Detector combinacional de la posición del bit más significativo (MSB)
+    // ------------------------------------------------------------------------
+    integer i;
+    reg [7:0] msb_pos;
+    always @(*) begin
+        msb_pos = 8'd0;
+        for (i = 0; i < WIDTH; i = i + 1) begin
+            if (exponent[i]) begin
+                msb_pos = i[7:0];
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------------
+    // FSM Principal
+    // ------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= ST_IDLE;
+            done        <= 1'b0;
+            busy        <= 1'b0;
+            mult_start  <= 1'b0;
+            mult_a      <= {WIDTH{1'b0}};
+            mult_b      <= {WIDTH{1'b0}};
+            result      <= {WIDTH{1'b0}};
+            acc         <= {WIDTH{1'b0}};
+            a_reg       <= {WIDTH{1 meb0}};
+            exponent    <= {WIDTH{1'b0}};
+            bit_cnt     <= 8'd0;
         end else begin
             case (state)
-                S_IDLE: begin
-                    done <= 0;
+
+                ST_IDLE: begin
+                    done <= 1'b0;
                     if (start) begin
-                        base_reg    <= Z_in;       // Z original
-                        result_reg  <= R_MOD_P;    // Inicia en "1" (Montgomery)
-                        bit_counter <= 0;          // Iniciamos desde el bit 0 (LSB)
-                        state       <= S_CHECK_BIT;
-                    end
-                end
-
-                // Algoritmo Square-and-Multiply de Derecha a Izquierda
-                S_CHECK_BIT: begin
-                    if (bit_counter == 256) begin
-                        Z_inv <= result_reg;
-                        state <= S_DONE;
-                    end else if (P_MINUS_2[bit_counter] == 1'b1) begin
-                        // Si el bit es 1: Result = Result * Base
-                        mult_A <= result_reg;
-                        mult_B <= base_reg;
-                        mult_start <= 1;
-                        state <= S_WAIT_MULT;
+                        busy     <= 1'b1;
+                        a_reg    <= a;
+                        exponent <= p_minus_2;
+                        state    <= ST_INIT;
                     end else begin
-                        // Si el bit es 0, saltamos directo a cuadrar la base
-                        state <= S_SQUARE;
+                        busy     <= 1'b0;
                     end
                 end
 
-                S_WAIT_MULT: begin
-                    mult_start <= 0;
+                // Detectar el MSB de P-2 e iniciar el acumulador con 'a'
+                ST_INIT: begin
+                    acc     <= a_reg;
+                    bit_cnt <= msb_pos - 1'b1;
+                    state   <= ST_SQR_START;
+                end
+
+                // ------------------------------------------------------------
+                // Paso 1: Cuadratura siempre (acc = acc^2 mod P)
+                // ------------------------------------------------------------
+                ST_SQR_START: begin
+                    mult_a     <= acc;
+                    mult_b     <= acc;
+                    mult_start <= 1'b1;
+                    state      <= ST_SQR_WAIT;
+                end
+
+                ST_SQR_WAIT: begin
+                    mult_start <= 1'b0;
                     if (mult_done) begin
-                        result_reg <= mult_out;
-                        state <= S_SQUARE;
+                        acc   <= mult_result;
+                        state <= ST_MUL_CHECK;
                     end
                 end
 
-                S_SQUARE: begin
-                    // Base = Base * Base
-                    mult_A <= base_reg;
-                    mult_B <= base_reg;
-                    mult_start <= 1;
-                    state <= S_WAIT_SQR;
+                // ------------------------------------------------------------
+                // Paso 2: Evaluar si el bit actual de P-2 es 1
+                // ------------------------------------------------------------
+                ST_MUL_CHECK: begin
+                    if (exponent[bit_cnt]) begin
+                        state <= ST_MUL_START;
+                    end else begin
+                        if (bit_cnt == 8'd0) begin
+                            state <= ST_DONE;
+                        end else begin
+                            bit_cnt <= bit_cnt - 1'b1;
+                            state   <= ST_SQR_START;
+                        end
+                    end
                 end
 
-                S_WAIT_SQR: begin
-                    mult_start <= 0;
+                // Multiplicación condicional (acc = acc * a mod P)
+                ST_MUL_START: begin
+                    mult_a     <= acc;
+                    mult_b     <= a_reg;
+                    mult_start <= 1'b1;
+                    state      <= ST_MUL_WAIT;
+                end
+
+                ST_MUL_WAIT: begin
+                    mult_start <= 1'b0;
                     if (mult_done) begin
-                        base_reg <= mult_out;
-                        bit_counter <= bit_counter + 1;
-                        state <= S_CHECK_BIT;
+                        acc <= mult_result;
+                        if (bit_cnt == 8'd0) begin
+                            state <= ST_DONE;
+                        end else begin
+                            bit_cnt <= bit_cnt - 1'b1;
+                            state   <= ST_SQR_START;
+                        end
                     end
                 end
 
-                S_DONE: begin
-                    done <= 1;
-                    state <= S_IDLE;
+                // ------------------------------------------------------------
+                // Finalización
+                // ------------------------------------------------------------
+                ST_DONE: begin
+                    result <= acc;
+                    done   <= 1'b1;
+                    busy   <= 1'b0;
+                    state  <= ST_IDLE;
                 end
+
+                default: state <= ST_IDLE;
             endcase
         end
     end
+
 endmodule

@@ -1,151 +1,205 @@
-`timescale 1ns / 1ps
-
 // ============================================================================
-// MÓDULO: Multiplicador Modular Montgomery (Radix-2 / Serial-Bit)
-// OBJETIVO: Mínimo consumo de área (0 DSPs, basado en LUTs y Flip-Flops)
-// OPERACIÓN: S = (A * B * R^-1) mod P
-// DOMINIO: Asume entradas pre-transformadas. Retorna salida en el mismo dominio.
+// Módulo: montgomery_multiplier.v
+// Algoritmo: CIOS Montgomery Multiplication (Word-Based, W = 16 bits)
+// Optimizado para: Intel Cyclone IV (Inferencia nativa de DSP 18x18)
+// Operación: Result = (A * B * R^-1) mod P
 // ============================================================================
 
 module montgomery_multiplier #(
-    parameter W = 256 // Ancho de bus configurado para secp256k1
+    parameter WIDTH     = 256,
+    parameter WORD_SIZE = 16,
+    parameter NUM_WORDS = WIDTH / WORD_SIZE // 256 / 16 = 16 palabras
 )(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,   // Señal de inicio (pulso de 1 ciclo)
-    input  wire [W-1:0] A,       // Operando A 
-    input  wire [W-1:0] B,       // Operando B (Multiplicador)
-    input  wire [W-1:0] P,       // Módulo Primo
-    output reg  [W-1:0] S_out,   // Resultado final
-    output reg          done     // Bandera de finalización (alta por 1 ciclo)
+    input  wire                 clk,
+    input  wire                 rst_n,
+    
+    // Control
+    input  wire                 start,
+    output reg                  done,
+    output reg                  busy,
+    
+    // Entradas de datos (256 bits)
+    input  wire [WIDTH-1:0]     a,
+    input  wire [WIDTH-1:0]     b,
+    input  wire [WIDTH-1:0]     p,
+    
+    // Constante n_prime0 = (-P^-1) mod 2^16
+    // Para secp256k1 con W=16, n_prime0 = 16'h2ECD
+    input  wire [WORD_SIZE-1:0] n_prime0,
+    
+    // Salida
+    output reg  [WIDTH-1:0]     result
 );
 
-    // ========================================================================
-    // 1. DEFINICIÓN DE ESTADOS DE LA FSM (Codificación One-Hot o Binaria)
-    // Justificación: 4 estados requieren solo 2 Flip-Flops. 
-    // ========================================================================
-    localparam IDLE   = 2'b00; // Esperando señal de start
-    localparam CALC   = 2'b01; // Ejecutando bucle de 256 iteraciones
-    localparam REDUCE = 2'b10; // Resta final si S >= P
-    localparam DONE_S = 2'b11; // Entregar resultado
+    // ------------------------------------------------------------------------
+    // Estados de la FSM
+    // ------------------------------------------------------------------------
+    localparam ST_IDLE       = 3'b000;
+    localparam ST_MULT_ACC   = 3'b001;
+    localparam ST_M_CALC     = 3'b010;
+    localparam ST_REDUCE     = 3'b011;
+    localparam ST_NEXT_WORD  = 3'b100;
+    localparam ST_FINAL_SUB  = 3'b101;
+    localparam ST_DONE       = 3'b110;
 
-    reg [1:0] state, next_state;
+    reg [2:0] state;
 
-    // ========================================================================
-    // 2. REGISTROS INTERNOS (Memoria del Datapath)
-    // Justificación: Aislamos las entradas para que el módulo externo pueda
-    // cambiar sus buses sin corromper nuestro cálculo que dura 256 ciclos.
-    // ========================================================================
-    reg [W-1:0] a_reg;
-    reg [W-1:0] b_reg; 
-    reg [W-1:0] p_reg;
+    // ------------------------------------------------------------------------
+    // Registros Internos y Acumuladores
+    // ------------------------------------------------------------------------
+    reg [WORD_SIZE-1:0] t [0:NUM_WORDS]; // Memoria temporal T (17 palabras de 16 bits)
+    reg [35:0]          acc;              // Acumulador de 36 bits (evita overflow)
+    reg [WORD_SIZE-1:0] m;                // Factor de reducción m = (T[0] * n_prime0) mod 2^16
     
-    // IMPORTANTE: El acumulador 's_reg' necesita W+2 bits (258 bits).
-    // ¿Por qué? Durante la iteración sumamos S + A + P. Si S, A y P son 
-    // de 256 bits, su suma máxima es ~3P, lo que requiere 2 bits extra para
-    // no perder datos (desbordamiento/overflow) antes de hacer el shift a la derecha.
-    reg [W+1:0] s_reg; 
+    // Índices de bucles
+    reg [4:0] i; // Índice palabra exterior (0 a 15)
+    reg [4:0] j; // Índice palabra interior (0 a 15)
 
-    // Contador para las iteraciones (0 a 255 requiere 8 bits. Usamos 9 para seguridad)
-    reg [8:0] count;
+    // Extracción de palabras
+    wire [WORD_SIZE-1:0] a_word = a[i*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] b_word = b[j*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] p_word = p[j*WORD_SIZE +: WORD_SIZE];
 
-    // ========================================================================
-    // 3. LÓGICA COMBINACIONAL (La ALU interna de Montgomery)
-    // Justificación: Evitamos multiplicadores. Usamos MUXes (condicionales '?:')
-    // inferidos nativamente en LUTs. 
-    // ========================================================================
-    
-    // a) Si el LSB de B es 1, preparamos A para sumar, si es 0, sumamos 0.
-    wire [W+1:0] add_a = b_reg[0] ? {2'b00, a_reg} : {(W+2){1'b0}};
-    
-    // b) Primer sumador: S_actual + (A o 0)
-    wire [W+1:0] temp_s = s_reg + add_a;
-    
-    // c) Evaluamos si el resultado parcial es impar (LSB == 1). 
-    // Si es impar, sumamos P para volverlo par y no perder precisión al dividir.
-    wire [W+1:0] add_p = temp_s[0] ? {2'b00, p_reg} : {(W+2){1'b0}};
-    
-    // d) Segundo sumador: temp_s + (P o 0)
-    wire [W+1:0] next_s = temp_s + add_p;
+    integer k;
 
-    // ========================================================================
-    // 4. LÓGICA SECUENCIAL: MÁQUINA DE ESTADOS FINITOS (FSM)
-    // Justificación: Sincronizada por reloj (clk) para mapear a Flip-Flops.
-    // ========================================================================
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state <= IDLE;
-            a_reg <= 0;
-            b_reg <= 0;
-            p_reg <= 0;
-            s_reg <= 0;
-            count <= 0;
-            S_out <= 0;
-            done  <= 0;
+    // ------------------------------------------------------------------------
+    // Máquina de Estados Finita (FSM)
+    // ------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state   <= ST_IDLE;
+            done    <= 1'b0;
+            busy    <= 1'b0;
+            result  <= {WIDTH{1'b0}};
+            i       <= 5'd0;
+            j       <= 5'd0;
+            acc     <= 36'd0;
+            m       <= 16'd0;
+            for (k = 0; k <= NUM_WORDS; k = k + 1) begin
+                t[k] <= 16'd0;
+            end
         end else begin
             case (state)
+                
                 // ------------------------------------------------------------
-                // ESTADO: IDLE
-                // Espera 'start' y captura datos.
+                // IDLE: Esperar pulso de inicio
                 // ------------------------------------------------------------
-                IDLE: begin
+                ST_IDLE: begin
                     done <= 1'b0;
                     if (start) begin
-                        a_reg <= A;
-                        b_reg <= B;
-                        p_reg <= P;
-                        s_reg <= 0;      // Acumulador inicia en 0
-                        count <= 0;      // Contador inicia en 0
-                        state <= CALC;
-                    end
-                end
-
-                // ------------------------------------------------------------
-                // ESTADO: CALC (Núcleo de Radix-2)
-                // Justificación: Se ejecuta 256 veces. El "shift derecho" (>> 1) 
-                // en next_s divide entre 2 sin consumir lógica, solo redirige cables.
-                // ------------------------------------------------------------
-                CALC: begin
-                    // Actualiza acumulador con el resultado desplazado
-                    s_reg <= next_s >> 1;
-                    
-                    // Desplaza el multiplicador B. 
-                    // Justificación: Leer siempre b_reg[0] ahorra un gigantesco MUX 
-                    // de 256 entradas que destruiría el área de la FPGA si usáramos B[count].
-                    b_reg <= b_reg >> 1; 
-                    
-                    if (count == W - 1) begin
-                        state <= REDUCE; // Si ya hicimos 256 ciclos, terminar.
+                        busy  <= 1'b1;
+                        i     <= 5'd0;
+                        j     <= 5'd0;
+                        acc   <= 36'd0;
+                        for (k = 0; k <= NUM_WORDS; k = k + 1) begin
+                            t[k] <= 16'd0;
+                        end
+                        state <= ST_MULT_ACC;
                     end else begin
-                        count <= count + 1'b1;
+                        busy  <= 1'b0;
                     end
                 end
 
                 // ------------------------------------------------------------
-                // ESTADO: REDUCE
-                // Justificación: El algoritmo matemático dicta que el resultado
-                // final puede ser mayor a P (pero siempre menor a 2P). Se hace
-                // una única resta combinacional si es necesario.
+                // ST_MULT_ACC: Paso 1 de CIOS - Acumular A[i] * B[j] + T[j]
                 // ------------------------------------------------------------
-                REDUCE: begin
-                    if (s_reg >= {2'b00, p_reg}) begin
-                        S_out <= s_reg[W-1:0] - p_reg; // Resta P y recorta a 256 bits
+                ST_MULT_ACC: begin
+                    // acc = T[j] + A[i]*B[j] + carry
+                    acc <= t[j] + (a_word * b_word) + (acc >> WORD_SIZE);
+                    t[j] <= acc[WORD_SIZE-1:0];
+
+                    if (j == NUM_WORDS - 1) begin
+                        j     <= 5'd0;
+                        state <= ST_M_CALC;
                     end else begin
-                        S_out <= s_reg[W-1:0];         // Recorta y entrega
+                        j     <= j + 1'b1;
                     end
-                    state <= DONE_S;
                 end
 
                 // ------------------------------------------------------------
-                // ESTADO: DONE_S
-                // Levanta bandera 'done' para avisar a la FSM Superior (Jacobiana).
+                // ST_M_CALC: Guardar último acarreo y calcular factor m
                 // ------------------------------------------------------------
-                DONE_S: begin
+                ST_M_CALC: begin
+                    // Guardar palabra final de la fase de acumulación
+                    acc  <= t[NUM_WORDS] + (acc >> WORD_SIZE);
+                    t[NUM_WORDS] <= acc[WORD_SIZE-1:0];
+                    
+                    // m = (T[0] * n_prime0) mod 2^16
+                    m    <= t[0] * n_prime0;
+                    j    <= 5'd0;
+                    state<= ST_REDUCE;
+                end
+
+                // ------------------------------------------------------------
+                // ST_REDUCE: Paso 2 de CIOS - Reducción m * P[j] + T[j]
+                // ------------------------------------------------------------
+                ST_REDUCE: begin
+                    // acc = T[j] + m*P[j] + carry
+                    acc <= t[j] + (m * p_word) + (acc >> WORD_SIZE);
+                    
+                    if (j > 0) begin
+                        t[j-1] <= acc[WORD_SIZE-1:0]; // Desplazamiento de palabra hacia la derecha
+                    end
+
+                    if (j == NUM_WORDS - 1) begin
+                        j     <= 5'd0;
+                        state <= ST_NEXT_WORD;
+                    end else begin
+                        j     <= j + 1'b1;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // ST_NEXT_WORD: Desplazamiento final de palabra e incremento de i
+                // ------------------------------------------------------------
+                ST_NEXT_WORD: begin
+                    acc <= t[NUM_WORDS] + (acc >> WORD_SIZE);
+                    t[NUM_WORDS-1] <= acc[WORD_SIZE-1:0];
+                    t[NUM_WORDS]   <= (acc >> WORD_SIZE);
+
+                    if (i == NUM_WORDS - 1) begin
+                        state <= ST_FINAL_SUB;
+                    end else begin
+                        i     <= i + 1'b1;
+                        acc   <= 36'd0;
+                        state <= ST_MULT_ACC;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // ST_FINAL_SUB: Sustracción condicional si T >= P
+                // ------------------------------------------------------------
+                ST_FINAL_SUB: begin
+                    // Reconstruir vector completo de 256 bits desde t[]
+                    begin: build_res
+                        reg [WIDTH:0] temp_t;
+                        integer x;
+                        temp_t = 0;
+                        for (x = 0; x < NUM_WORDS; x = x + 1) begin
+                            temp_t[x*WORD_SIZE +: WORD_SIZE] = t[x];
+                        end
+                        temp_t[WIDTH] = t[NUM_WORDS][0];
+
+                        // Si T >= P, Result = T - P; en otro caso, Result = T
+                        if (temp_t >= p) begin
+                            result <= temp_t - p;
+                        end else begin
+                            result <= temp_t[WIDTH-1:0];
+                        end
+                    end
+                    state <= ST_DONE;
+                end
+
+                // ------------------------------------------------------------
+                // ST_DONE: Notificar finalización
+                // ------------------------------------------------------------
+                ST_DONE: begin
                     done  <= 1'b1;
-                    state <= IDLE;
+                    busy  <= 1'b0;
+                    state <= ST_IDLE;
                 end
 
-                default: state <= IDLE;
+                default: state <= ST_IDLE;
             endcase
         end
     end
