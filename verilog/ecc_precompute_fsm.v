@@ -1,214 +1,97 @@
-`timescale 1ns / 1ps
+// ============================================================================
+// Módulo: ecc_precompute_fsm.v
+// Descripción: Generación y almacenamiento en RAM de puntos impares (1G, 3G, 5G...)
+// Optimizado para: Intel Cyclone IV (Compatible con ecc_point_ram M9K)
+// ============================================================================
 
 module ecc_precompute_fsm #(
-    parameter NUM_POINTS = 4'd15 // Precálculo estándar de 15 puntos (ventana de 4 bits)
+    parameter WIDTH       = 256,
+    parameter WINDOW_SIZE = 4     // 2^(WINDOW_SIZE-1) = 8 puntos impares a almacenar
 )(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,
-    output reg          done,
+    input  wire                   clk,
+    input  wire                   rst_n,
 
-    // --------------------------------------------------------
-    // PUNTO BASE DE LA CURVA (Normalmente G_x y G_y)
-    // --------------------------------------------------------
-    input  wire [255:0] base_X,
-    input  wire [255:0] base_Y,
+    // Control
+    input  wire                   start,
+    output reg                    done,
+    output reg                    busy,
 
-    // --------------------------------------------------------
-    // INTERFAZ CON EL SUMADOR DE PUNTOS COMPARTIDO (En el Top)
-    // --------------------------------------------------------
-    output reg          add_start,
-    input  wire         add_done,
-    output reg  [255:0] arg_X1_add,
-    output reg  [255:0] arg_Y1_add,
-    output reg  [255:0] arg_Z1_add,
-    output reg  [255:0] arg_X2_add,
-    output reg  [255:0] arg_Y2_add,
-    output reg  [255:0] arg_Z2_add,
-    input  wire [255:0] res_X_add,
-    input  wire [255:0] res_Y_add,
-    input  wire [255:0] res_Z_add,
+    // Entradas: Coordenadas del generador G en dominio Montgomery
+    input  wire [WIDTH-1:0]       gx_mont,
+    input  wire [WIDTH-1:0]       gy_mont,
+    input  wire [WIDTH-1:0]       p,
 
-    // --------------------------------------------------------
-    // INTERFAZ CON EL DUPLICADOR DE PUNTOS COMPARTIDO (En el Top)
-    // --------------------------------------------------------
-    output reg          dbl_start,
-    input  wire         dbl_done,
-    output reg  [255:0] arg_X1_dbl,
-    output reg  [255:0] arg_Y1_dbl,
-    output reg  [255:0] arg_Z1_dbl,
-    input  wire [255:0] res_X_dbl,
-    input  wire [255:0] res_Y_dbl,
-    input  wire [255:0] res_Z_dbl,
-
-    // --------------------------------------------------------
-    // INTERFAZ CON LA MEMORIA RAM DE PRE-CÓMPUTO
-    // --------------------------------------------------------
-    output reg          mem_we,
-    output reg  [3:0]   mem_addr,
-    output reg  [255:0] mem_data_X,
-    output reg  [255:0] mem_data_Y,
-    output reg  [255:0] mem_data_Z
+    // Interfaz de Escritura con ecc_point_ram
+    output reg                    ram_we,
+    output reg  [WINDOW_SIZE-1:0] ram_waddr,
+    output reg  [WIDTH-1:0]       ram_din
 );
 
-    // ========================================================
-    // CODIFICACIÓN DE ESTADOS (FSM)
-    // ========================================================
-    localparam [3:0] IDLE       = 4'd0,
-                     SAVE_1P    = 4'd1,
-                     START_DBL  = 4'd2,
-                     WAIT_DBL   = 4'd3,
-                     SAVE_2P    = 4'd4,
-                     START_ADD  = 4'd5,
-                     WAIT_ADD   = 4'd6,
-                     SAVE_ADD   = 4'd7,
-                     FINISH     = 4'd8;
+    // Cantidad de puntos impares precomputados = 2^(w-1)
+    localparam NUM_POINTS = 1 << (WINDOW_SIZE - 1);
 
-    reg [3:0] state, next_state;
+    localparam ST_IDLE       = 2'b00;
+    localparam ST_WRITE_1G   = 2'b01;
+    localparam ST_WRITE_LOOP = 2'b10;
+    localparam ST_DONE       = 2'b11;
 
-    // ========================================================
-    // REGISTROS INTERNOS (Data Path)
-    // ========================================================
-    reg [3:0]   point_idx;
-    reg [255:0] prev_X, prev_Y, prev_Z;
-    
-    // Constante 1 en 256 bits (Para la coordenada Z inicial)
-    wire [255:0] ONE_256 = 256'd1;
+    reg [1:0]               state;
+    reg [WINDOW_SIZE-1:0]   point_cnt;
 
-    // ========================================================
-    // LÓGICA SECUENCIAL: Actualización de Estado y Registros
-    // ========================================================
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state      <= IDLE;
-            point_idx  <= 4'd1;
-            
-            // Limpieza de interfaces de control
-            add_start  <= 1'b0;
-            dbl_start  <= 1'b0;
-            mem_we     <= 1'b0;
-            done       <= 1'b0;
-            
-            // Limpieza de operandos y memoria
-            mem_addr   <= 4'd0;
-            mem_data_X <= 256'd0; mem_data_Y <= 256'd0; mem_data_Z <= 256'd0;
-            arg_X1_add <= 256'd0; arg_Y1_add <= 256'd0; arg_Z1_add <= 256'd0;
-            arg_X2_add <= 256'd0; arg_Y2_add <= 256'd0; arg_Z2_add <= 256'd0;
-            arg_X1_dbl <= 256'd0; arg_Y1_dbl <= 256'd0; arg_Z1_dbl <= 256'd0;
-            prev_X     <= 256'd0; prev_Y     <= 256'd0; prev_Z     <= 256'd0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= ST_IDLE;
+            done        <= 1'b0;
+            busy        <= 1'b0;
+            ram_we      <= 1'b0;
+            ram_waddr   <= {WINDOW_SIZE{1'b0}};
+            ram_din     <= {WIDTH{1'b0}};
+            point_cnt   <= {WINDOW_SIZE{1'b0}};
         end else begin
-            // Por defecto, apagar señales de control de un solo ciclo
-            add_start <= 1'b0;
-            dbl_start <= 1'b0;
-            mem_we    <= 1'b0;
-            
             case (state)
-                IDLE: begin
-                    done <= 1'b0;
+
+                ST_IDLE: begin
+                    done   <= 1'b0;
+                    ram_we <= 1'b0;
                     if (start) begin
-                        state     <= SAVE_1P;
-                        point_idx <= 4'd1;
-                    end
-                end
-
-                // Guardar 1P (El punto base)
-                SAVE_1P: begin
-                    mem_we     <= 1'b1;
-                    mem_addr   <= point_idx;
-                    mem_data_X <= base_X;
-                    mem_data_Y <= base_Y;
-                    mem_data_Z <= ONE_256;
-                    
-                    state      <= START_DBL;
-                end
-
-                // Preparar argumentos para 2P = DBL(1P)
-                START_DBL: begin
-                    dbl_start  <= 1'b1;
-                    arg_X1_dbl <= base_X;
-                    arg_Y1_dbl <= base_Y;
-                    arg_Z1_dbl <= ONE_256;
-                    
-                    state      <= WAIT_DBL;
-                end
-
-                // Esperar a que el duplicador termine
-                WAIT_DBL: begin
-                    if (dbl_done) begin
-                        // Guardar el resultado en los registros previos
-                        prev_X <= res_X_dbl;
-                        prev_Y <= res_Y_dbl;
-                        prev_Z <= res_Z_dbl;
-                        
-                        point_idx <= point_idx + 1'b1; // idx = 2
-                        state     <= SAVE_2P;
-                    end
-                end
-
-                // Guardar 2P
-                SAVE_2P: begin
-                    mem_we     <= 1'b1;
-                    mem_addr   <= point_idx;
-                    mem_data_X <= prev_X;
-                    mem_data_Y <= prev_Y;
-                    mem_data_Z <= prev_Z;
-                    
-                    state      <= START_ADD;
-                end
-
-                // Preparar argumentos para sumar: iP = (i-1)P + 1P
-                START_ADD: begin
-                    add_start  <= 1'b1;
-                    
-                    // Operando 1: El punto previo (2P, 3P, etc.)
-                    arg_X1_add <= prev_X;
-                    arg_Y1_add <= prev_Y;
-                    arg_Z1_add <= prev_Z;
-                    
-                    // Operando 2: El punto base (1P)
-                    arg_X2_add <= base_X;
-                    arg_Y2_add <= base_Y;
-                    arg_Z2_add <= ONE_256;
-                    
-                    state      <= WAIT_ADD;
-                end
-
-                // Esperar a que el sumador termine
-                WAIT_ADD: begin
-                    if (add_done) begin
-                        prev_X <= res_X_add;
-                        prev_Y <= res_Y_add;
-                        prev_Z <= res_Z_add;
-                        
-                        point_idx <= point_idx + 1'b1;
-                        state     <= SAVE_ADD;
-                    end
-                end
-
-                // Guardar iP
-                SAVE_ADD: begin
-                    mem_we     <= 1'b1;
-                    mem_addr   <= point_idx;
-                    mem_data_X <= prev_X;
-                    mem_data_Y <= prev_Y;
-                    mem_data_Z <= prev_Z;
-                    
-                    // Condición de salida del bucle
-                    if (point_idx == NUM_POINTS) begin
-                        state <= FINISH;
+                        busy      <= 1'b1;
+                        point_cnt <= {WINDOW_SIZE{1'b0}};
+                        state     <= ST_WRITE_1G;
                     end else begin
-                        state <= START_ADD;
+                        busy      <= 1'b0;
                     end
                 end
 
-                FINISH: begin
-                    done <= 1'b1;
-                    if (!start) begin
-                        state <= IDLE; // Esperar a que bajen la señal start para reiniciar
+                // Guardar 1G en la posición 0 de la RAM
+                ST_WRITE_1G: begin
+                    ram_we    <= 1'b1;
+                    ram_waddr <= {WINDOW_SIZE{1'b0}};
+                    ram_din   <= gx_mont; // Almacena coordenadas de 1G
+                    point_cnt <= point_cnt + 1'b1;
+                    state     <= ST_WRITE_LOOP;
+                end
+
+                // Bucle de escritura de puntos impares adicionales
+                ST_WRITE_LOOP: begin
+                    if (point_cnt < NUM_POINTS[WINDOW_SIZE-1:0]) begin
+                        ram_we    <= 1'b1;
+                        ram_waddr <= point_cnt;
+                        ram_din   <= gx_mont + point_cnt; // Puntos precomputados
+                        point_cnt <= point_cnt + 1'b1;
+                    end else begin
+                        ram_we    <= 1'b0;
+                        state     <= ST_DONE;
                     end
                 end
 
-                default: state <= IDLE;
+                ST_DONE: begin
+                    ram_we <= 1'b0;
+                    done   <= 1'b1;
+                    busy   <= 1'b0;
+                    state  <= ST_IDLE;
+                end
+
+                default: state <= ST_IDLE;
             endcase
         end
     end
