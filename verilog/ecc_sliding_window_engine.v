@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: ecc_sliding_window_engine.v
+// Módulo: ecc_sliding_window_engine.v (Sin errores de sintaxis)
 // ============================================================================
 
 module ecc_sliding_window_engine #(
@@ -79,13 +79,11 @@ module ecc_sliding_window_engine #(
                         reg [WINDOW_SIZE-1:0] raw_win;
                         integer win_len;
 
-                        // Desplazamiento seguro sin mezcla de tipos signed/unsigned
                         if (bit_idx >= WINDOW_SIZE - 1)
                             shifted_k = k_reg >> (bit_idx - (WINDOW_SIZE - 1));
                         else
                             shifted_k = k_reg << (WINDOW_SIZE - 1 - bit_idx);
 
-                        // Slice explícito para evitar truncamiento implícito
                         raw_win = shifted_k[WINDOW_SIZE-1:0];
 
                         win_len = WINDOW_SIZE;
@@ -105,9 +103,13 @@ module ecc_sliding_window_engine #(
                 end
 
                 ST_ACCUMULATE: begin
-                    x_out <= ram_dout;
-                    y_out <= (ram_dout + 1'b1)[WIDTH-1:0]; // Slice explícito [255:0]
-                    z_out <= 256'd1;
+                    begin: accum_block
+                        reg [WIDTH:0] temp_y;
+                        temp_y = {1'b0, ram_dout} + 1'b1;
+                        x_out <= ram_dout;
+                        y_out <= temp_y[WIDTH-1:0];
+                        z_out <= 256'd1;
+                    end
 
                     if (bit_idx < shift_cnt) begin
                         bit_idx <= -1;
