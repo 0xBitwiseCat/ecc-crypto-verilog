@@ -2,7 +2,7 @@
 // Módulo: jacobian_point_double.v (Genérico / Curve-Agnostic)
 // Operación: P3 (X3, Y3, Z3) = 2 * P1 (X1, Y1, Z1)
 // Coordenadas: Jacobianas (x = X/Z^2, y = Y/Z^3)
-// Optimizado para: Intel Cyclone IV (Reutiliza el Multiplicador de Montgomery)
+// Optimizado para: Intel Cyclone IV
 // ============================================================================
 
 module jacobian_point_double #(
@@ -33,21 +33,27 @@ module jacobian_point_double #(
 );
 
     // ------------------------------------------------------------------------
-    // Funciones Modulares Auxiliares (Aritmética combinacional)
+    // Funciones Modulares Auxiliares (Aritmética combinacional sin Warnings)
     // ------------------------------------------------------------------------
     function [WIDTH-1:0] mod_add;
         input [WIDTH-1:0] a, b, mod;
         reg [WIDTH:0] sum;
         begin
-            sum = a + b;
-            mod_add = (sum >= mod) ? (sum - mod) : sum[WIDTH-1:0];
+            sum = {1'b0, a} + {1'b0, b};
+            mod_add = (sum >= {1'b0, mod}) ? (sum - {1'b0, mod})[WIDTH-1:0] : sum[WIDTH-1:0];
         end
     endfunction
 
     function [WIDTH-1:0] mod_sub;
         input [WIDTH-1:0] a, b, mod;
+        reg [WIDTH:0] diff;
         begin
-            mod_sub = (a >= b) ? (a - b) : (a + mod - b);
+            if (a >= b) begin
+                diff = {1'b0, a} - {1'b0, b};
+            end else begin
+                diff = ({1'b0, a} + {1'b0, mod}) - {1'b0, b};
+            end
+            mod_sub = diff[WIDTH-1:0];
         end
     endfunction
 
@@ -73,16 +79,13 @@ module jacobian_point_double #(
     reg [3:0] state, next_state;
 
     // ------------------------------------------------------------------------
-    // Registros temporales de cálculo
+    // Registros temporales de cálculo (Se eliminaron z1_sq, z1_qu, t_y3)
     // ------------------------------------------------------------------------
     reg [WIDTH-1:0] y1_sq;
     reg [WIDTH-1:0] x1_sq;
     reg [WIDTH-1:0] s;       // S = 4 * X1 * Y1^2
     reg [WIDTH-1:0] c;       // C = 8 * Y1^4
-    reg [WIDTH-1:0] z1_sq;
-    reg [WIDTH-1:0] z1_qu;
     reg [WIDTH-1:0] m;       // M = 3 * X1^2 + a * Z1^4
-    reg [WIDTH-1:0] t_y3;
 
     // ------------------------------------------------------------------------
     // Máquina de Estados Finita (FSM)
@@ -103,10 +106,7 @@ module jacobian_point_double #(
             x1_sq      <= {WIDTH{1'b0}};
             s          <= {WIDTH{1'b0}};
             c          <= {WIDTH{1'b0}};
-            z1_sq      <= {WIDTH{1'b0}};
-            z1_qu      <= {WIDTH{1'b0}};
             m          <= {WIDTH{1'b0}};
-            t_y3       <= {WIDTH{1'b0}};
         end else begin
             case (state)
 
@@ -211,9 +211,8 @@ module jacobian_point_double #(
                     end
                 end
 
-                // Si a != 0: Z1^2
+                // Si a != 0: Z1^2  ==> calcula Z1^4 directamente usando mult_result
                 ST_CALC_Z1SQ: begin
-                    z1_sq      <= mult_result;
                     mult_a     <= mult_result;
                     mult_b     <= mult_result;
                     mult_start <= 1'b1;
@@ -221,9 +220,8 @@ module jacobian_point_double #(
                     state      <= ST_MULT_WAIT;
                 end
 
-                // Si a != 0: Z1^4
+                // Si a != 0: Z1^4  ==> calcula a * Z1^4 usando mult_result
                 ST_CALC_Z1QU: begin
-                    z1_qu      <= mult_result;
                     mult_a     <= a_param;
                     mult_b     <= mult_result;
                     mult_start <= 1'b1;

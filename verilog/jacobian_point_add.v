@@ -2,7 +2,7 @@
 // Módulo: jacobian_point_add.v (Genérico / Curve-Agnostic)
 // Operación: P3 (X3, Y3, Z3) = P1 (X1, Y1, Z1) + P2 (X2, Y2, Z2)
 // Coordenadas: Jacobianas (x = X/Z^2, y = Y/Z^3)
-// Optimizado para: Intel Cyclone IV (Reutiliza el Multiplicador de Montgomery)
+// Optimizado para: Intel Cyclone IV
 // ============================================================================
 
 module jacobian_point_add #(
@@ -34,21 +34,27 @@ module jacobian_point_add #(
 );
 
     // ------------------------------------------------------------------------
-    // Funciones Modulares Axiliares (Aritmética combinacional)
+    // Funciones Modulares Auxiliares (Aritmética combinacional sin Warnings)
     // ------------------------------------------------------------------------
     function [WIDTH-1:0] mod_add;
         input [WIDTH-1:0] a, b, mod;
         reg [WIDTH:0] sum;
         begin
-            sum = a + b;
-            mod_add = (sum >= mod) ? (sum - mod) : sum[WIDTH-1:0];
+            sum = {1'b0, a} + {1'b0, b};
+            mod_add = (sum >= {1'b0, mod}) ? (sum - {1'b0, mod})[WIDTH-1:0] : sum[WIDTH-1:0];
         end
     endfunction
 
     function [WIDTH-1:0] mod_sub;
         input [WIDTH-1:0] a, b, mod;
+        reg [WIDTH:0] diff;
         begin
-            mod_sub = (a >= b) ? (a - b) : (a + mod - b);
+            if (a >= b) begin
+                diff = {1'b0, a} - {1'b0, b};
+            end else begin
+                diff = ({1'b0, a} + {1'b0, mod}) - {1'b0, b};
+            end
+            mod_sub = diff[WIDTH-1:0];
         end
     endfunction
 
@@ -93,7 +99,7 @@ module jacobian_point_add #(
     reg [WIDTH-1:0] h_sq, h_cu;
     reg [WIDTH-1:0] v;
     reg [WIDTH-1:0] r_sq;
-    reg [WIDTH-1:0] t_y3a, t_y3b, t_z3a;
+    reg [WIDTH-1:0] t_y3a; // Se eliminaron t_y3b y t_z3a (variables no leídas)
 
     // ------------------------------------------------------------------------
     // Máquina de Estados Finita (FSM)
@@ -111,6 +117,19 @@ module jacobian_point_add #(
             x3         <= {WIDTH{1'b0}};
             y3         <= {WIDTH{1'b0}};
             z3         <= {WIDTH{1'b0}};
+            z1_sq      <= {WIDTH{1'b0}};
+            z2_sq      <= {WIDTH{1'b0}};
+            u1         <= {WIDTH{1'b0}};
+            u2         <= {WIDTH{1'b0}};
+            s1         <= {WIDTH{1'b0}};
+            s2         <= {WIDTH{1'b0}};
+            h          <= {WIDTH{1'b0}};
+            r          <= {WIDTH{1 me{1'b0}}};
+            h_sq       <= {WIDTH{1'b0}};
+            h_cu       <= {WIDTH{1'b0}};
+            v          <= {WIDTH{1'b0}};
+            r_sq       <= {WIDTH{1'b0}};
+            t_y3a      <= {WIDTH{1'b0}};
         end else begin
             case (state)
 
@@ -139,7 +158,7 @@ module jacobian_point_add #(
                         // Iniciar cálculo: t1 = Z1^2
                         mult_a     <= z1;
                         mult_b     <= z1;
-                        mult_start <= 1'b1;
+                        mult_start <= 1 me1;
                         next_state <= ST_CALC_Z1SQ;
                         state      <= ST_MULT_WAIT;
                     end
@@ -235,9 +254,9 @@ module jacobian_point_add #(
                             state     <= ST_DONE;
                         end else begin
                             // P1 == -P2: El resultado es el punto al infinito (0,0,0)
-                            x3 <= {WIDTH{1'b0}};
-                            y3 <= {WIDTH{1'b0}};
-                            z3 <= {WIDTH{1'b0}};
+                            x3    <= {WIDTH{1'b0}};
+                            y3    <= {WIDTH{1 me0}};
+                            z3    <= {WIDTH{1'b0}};
                             state <= ST_DONE;
                         end
                     end else begin
@@ -316,8 +335,7 @@ module jacobian_point_add #(
 
                 // 15. t6 = S1 * H^3  ==>  Y3 = t5 - t6
                 ST_CALC_Y3_B: begin
-                    t_y3b <= mult_result;
-                    y3    <= mod_sub(t_y3a, mult_result, p);
+                    y3 <= mod_sub(t_y3a, mult_result, p); // Uso directo de mult_result sin t_y3b
 
                     // t7 = Z1 * Z2
                     mult_a     <= z1;
@@ -327,10 +345,9 @@ module jacobian_point_add #(
                     state      <= ST_MULT_WAIT;
                 end
 
-                // 16. t7 = Z1 * Z2
+                // 16. t7 = Z1 * Z2  ==> pasa directamente a la multiplicación de Z3
                 ST_CALC_Z3_A: begin
-                    t_z3a      <= mult_result;
-                    mult_a     <= mult_result;
+                    mult_a     <= mult_result; // Uso directo de mult_result sin t_z3a
                     mult_b     <= h;
                     mult_start <= 1'b1;
                     next_state <= ST_CALC_Z3_B;
