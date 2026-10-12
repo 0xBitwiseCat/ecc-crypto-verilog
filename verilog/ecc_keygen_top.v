@@ -1,7 +1,7 @@
 // ============================================================================
 // Módulo: ecc_keygen_top.v (Top-Level Criptográfico)
 // Descripción: Orquestador principal para la generación de llave pública Q = k * G
-// Curva: secp256k1 (Configurable mediante parámetros)
+// Curva: secp256k1
 // Optimizado para: Intel Cyclone IV (Quartus Prime)
 // ============================================================================
 
@@ -40,11 +40,11 @@ module ecc_keygen_top #(
     // ESTADOS DE LA FSM CONTROLADORA PRINCIPAL
     // ------------------------------------------------------------------------
     localparam ST_IDLE       = 3'b000;
-    localparam ST_CONVERT    = 3'b001; // Conversión G(x,y) a Dominio Montgomery
-    localparam ST_PRECOMPUTE = 3'b010; // Precómputo de puntos 1G, 3G, 5G...
-    localparam ST_SCALAR_MUL = 3'b011; // Motor Sliding Window
-    localparam ST_CONV_AFFINE= 3'b100; // Inversión Fermat Z^-1 para mapeo a coordenadas afines
-    localparam ST_MAP_FINAL  = 3'b101; // Salida final de coordenadas Qx, Qy
+    localparam ST_CONVERT    = 3'b001;
+    localparam ST_PRECOMPUTE = 3'b010;
+    localparam ST_SCALAR_MUL = 3'b011;
+    localparam ST_CONV_AFFINE= 3'b100;
+    localparam ST_MAP_FINAL  = 3'b101;
     localparam ST_DONE       = 3'b110;
 
     reg [2:0] state;
@@ -105,7 +105,7 @@ module ecc_keygen_top #(
     wire [WIDTH-1:0] add_mult_a, add_mult_b, dbl_mult_a, dbl_mult_b;
 
     // ------------------------------------------------------------------------
-    // INSTANCIACIÓN DE SUBMÓDULOS CON NOMBRES DE PARÁMETROS ESPECÍFICOS
+    // INSTANCIACIÓN DE SUBMÓDULOS
     // ------------------------------------------------------------------------
 
     // 1. Memoria RAM M9K
@@ -138,7 +138,7 @@ module ecc_keygen_top #(
         .result  (mult_result)
     );
 
-    // 3. Conversor de Coordenadas de Dominio (Usa el parámetro W)
+    // 3. Conversor de Coordenadas de Dominio
     domain_coordinate_converter #(
         .W(WIDTH)
     ) domain_conv_inst (
@@ -160,7 +160,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 4. FSM de Precomputación de Puntos Impares (1G, 3G, 5G...)
+    // 4. FSM de Precomputación de Puntos Impares
     ecc_precompute_fsm #(
         .WIDTH      (WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
@@ -178,7 +178,7 @@ module ecc_keygen_top #(
         .ram_din    (precomp_ram_din)
     );
 
-    // 5. Motor de Ventana Deslizante (Sliding Window Engine)
+    // 5. Motor de Ventana Deslizante
     ecc_sliding_window_engine #(
         .WIDTH      (WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
