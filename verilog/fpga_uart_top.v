@@ -1,6 +1,7 @@
 // ============================================================================
 // Módulo: fpga_uart_top.v
-// Descripción: Wrapper UART optimizado y desacoplado para ecc_keygen_top
+// Descripción: Wrapper UART optimizado mediante Registro de Desplazamiento Fijo
+//              para minimizar el consumo de LEs en Intel Cyclone IV.
 // ============================================================================
 
 module fpga_uart_top (
@@ -19,7 +20,7 @@ module fpga_uart_top (
     wire [255:0] pub_key_x;
     wire [255:0] pub_key_y;
 
-    // Buffer de transmisión independiente de 512 bits (32B Qx + 32B Qy)
+    // Buffer de transmisión de 512 bits (32B Qx + 32B Qy)
     reg  [511:0] tx_buffer;
 
     // ------------------------------------------------------------------------
@@ -53,7 +54,7 @@ module fpga_uart_top (
     reg        tx_start;
     wire       tx_busy;
 
-    // Instancia de submódulos UART RX y TX (estándar de 8 bits a 115200 baudios)
+    // Instancia de submódulos UART RX y TX (115200 baudios @ 50 MHz)
     uart_rx #(.CLK_FREQ(50000000), .BAUD_RATE(115200)) uart_rx_inst (
         .clk(clk), .rst_n(rst_n), .rx(rx_pin), .data_out(rx_byte), .valid(rx_valid)
     );
@@ -97,30 +98,32 @@ module fpga_uart_top (
                 ST_PROCESS: begin
                     start_keygen <= 1'b0;
                     if (done_keygen) begin
-                        // Capturar Qx (MSB) y Qy (LSB) en el buffer estático
+                        // Cargar Qx (MSB) y Qy (LSB) en el buffer
                         tx_buffer <= {pub_key_x, pub_key_y};
                         byte_cnt  <= 6'd0;
                         state     <= ST_TX_START;
                     end
                 end
 
-                // 3. Cargar el byte correspondiente y generar el pulso tx_start
+                // 3. Extraer SIEMPRE el byte superior fijo [511:504] (sin MUX dinámico)
                 ST_TX_START: begin
-                    tx_byte  <= tx_buffer[(63 - byte_cnt)*8 +: 8];
+                    tx_byte  <= tx_buffer[511:504];
                     tx_start <= 1'b1;
                     state    <= ST_TX_WAIT;
                 end
 
-                // 4. Esperar la transmisión completa del byte antes de avanzar
+                // 4. Transmitir y desplazar 8 bits a la izquierda en cada iteración
                 ST_TX_WAIT: begin
                     tx_start <= 1'b0;
                     if (!tx_busy && !tx_start) begin
                         if (byte_cnt == 6'd63) begin
                             byte_cnt <= 6'd0;
-                            state    <= ST_RX_BYTES; // Listo para la siguiente prueba
+                            state    <= ST_RX_BYTES; // Listo para la siguiente llave
                         end else begin
-                            byte_cnt <= byte_cnt + 1'b1;
-                            state    <= ST_TX_START;
+                            // Shift left de 8 bits para exponer el siguiente byte en [511:504]
+                            tx_buffer <= {tx_buffer[503:0], 8'd0};
+                            byte_cnt  <= byte_cnt + 1'b1;
+                            state     <= ST_TX_START;
                         end
                     end
                 end
