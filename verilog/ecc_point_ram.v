@@ -1,10 +1,10 @@
 // ============================================================================
 // Módulo: ecc_point_ram.v
-// Descripción: Memoria RAM de Bloque Dual-Port para almacenamiento de 
-//              puntos precomputados (Qx, Qy) en secp256k1.
+// Descripción: Inferencia directa en bloques BRAM M9K de Intel Cyclone IV
+// Capacidad: 32 palabras x 512 bits (16 Kbits)
 // ============================================================================
 
-module ecc_point_ram #(
+(* ramstyle = "M9K" *) module ecc_point_ram #(
     parameter WIDTH       = 256,
     parameter WINDOW_SIZE = 6
 )(
@@ -18,23 +18,18 @@ module ecc_point_ram #(
     output reg  [WIDTH-1:0]           dout_y
 );
 
-    // Tamaño de la memoria RAM: 2^(WINDOW_SIZE-1) = 32 palabras
-    localparam RAM_DEPTH = 1 << (WINDOW_SIZE - 1);
+    localparam RAM_DEPTH = 1 << (WINDOW_SIZE - 1); // 32 entradas
 
-    // Declaración de bloques RAM
-    reg [WIDTH-1:0] ram_x [0:RAM_DEPTH-1];
-    reg [WIDTH-1:0] ram_y [0:RAM_DEPTH-1];
+    // Directiva de compilador para forzar el uso de bloques M9K
+    (* ramstyle = "M9K" *) reg [WIDTH-1:0] ram_x [0:RAM_DEPTH-1];
+    (* ramstyle = "M9K" *) reg [WIDTH-1:0] ram_y [0:RAM_DEPTH-1];
 
-    // Puerto de Escritura
+    // Operación síncrona en un solo flanco de reloj (sin reset asíncrono)
     always @(posedge clk) begin
         if (we) begin
             ram_x[waddr] <= din_x;
             ram_y[waddr] <= din_y;
         end
-    end
-
-    // Puerto de Lectura
-    always @(posedge clk) begin
         dout_x <= ram_x[raddr];
         dout_y <= ram_y[raddr];
     end
