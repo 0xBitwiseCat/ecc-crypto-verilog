@@ -1,38 +1,42 @@
 // ============================================================================
 // Módulo: ecc_point_ram.v
-// Objetivo: Almacenamiento de puntos precomputados (coordenadas Jacobianas/Afines)
-// Optimizado para: Intel Cyclone IV (Inferencia nativa de Bloques M9K)
+// Descripción: Memoria RAM de Bloque Dual-Port para almacenamiento de 
+//              puntos precomputados (Qx, Qy) en secp256k1.
 // ============================================================================
 
 module ecc_point_ram #(
-    parameter DATA_WIDTH = 256,  // Ancho de palabra para coordenadas de 256 bits (secp256k1 / NIST P-256)
-    parameter ADDR_WIDTH = 4     // 2^4 = 16 posiciones (suficiente para tabla de precomputo con w=4)
+    parameter WIDTH       = 256,
+    parameter WINDOW_SIZE = 6
 )(
-    input  wire                  clk,
-    
-    // --- Puerto de Escritura ---
-    input  wire                  we,
-    input  wire [ADDR_WIDTH-1:0] write_addr,
-    input  wire [DATA_WIDTH-1:0] data_in,
-    
-    // --- Puerto de Lectura ---
-    input  wire [ADDR_WIDTH-1:0] read_addr,
-    output reg  [DATA_WIDTH-1:0] data_out
+    input  wire                       clk,
+    input  wire                       we,
+    input  wire [WINDOW_SIZE-2:0]     waddr,
+    input  wire [WIDTH-1:0]           din_x,
+    input  wire [WIDTH-1:0]           din_y,
+    input  wire [WINDOW_SIZE-2:0]     raddr,
+    output reg  [WIDTH-1:0]           dout_x,
+    output reg  [WIDTH-1:0]           dout_y
 );
 
-    // Directiva explícita de síntesis para Quartus Prime / Quartus II
-    (* ramstyle = "M9K, no_rw_check" *) reg [DATA_WIDTH-1:0] ram [0:(1<<ADDR_WIDTH)-1];
+    // Tamaño de la memoria RAM: 2^(WINDOW_SIZE-1) = 32 palabras
+    localparam RAM_DEPTH = 1 << (WINDOW_SIZE - 1);
 
-    // 1. Escritura Síncrona
+    // Declaración de bloques RAM
+    reg [WIDTH-1:0] ram_x [0:RAM_DEPTH-1];
+    reg [WIDTH-1:0] ram_y [0:RAM_DEPTH-1];
+
+    // Puerto de Escritura
     always @(posedge clk) begin
         if (we) begin
-            ram[write_addr] <= data_in;
+            ram_x[waddr] <= din_x;
+            ram_y[waddr] <= din_y;
         end
     end
 
-    // 2. Lectura Estrictamente Síncrona (Requisito fundamental para inferir M9K)
+    // Puerto de Lectura
     always @(posedge clk) begin
-        data_out <= ram[read_addr];
+        dout_x <= ram_x[raddr];
+        dout_y <= ram_y[raddr];
     end
 
 endmodule
