@@ -2,8 +2,8 @@
 // Módulo: jacobian_point_op.v
 // Descripción: Operador Geométrico-Jacobiano Unificado (Adición y Doblamiento)
 //              para secp256k1 (a=0) en Dominio Montgomery.
-// Optimización: Procesamiento por Palabras (W=16 bits) para Suma/Resta Modular
-//               para reducir el uso de ALUTs de 10,680 a ~1,100.
+// Optimización: ALU Modular Pipelined de 256 bits en 2 ciclos.
+//               Evita la poda de lógica (logic pruning) de Quartus.
 // Optimizado para: Intel Cyclone IV (EP4CE6E22C8)
 // ============================================================================
 
@@ -54,7 +54,7 @@ module jacobian_point_op #(
     localparam ST_DBL_M2        = 6'd10;
     localparam ST_DBL_2S        = 6'd11;
     localparam ST_DBL_X3        = 6'd12;
-    localparam ST_DBL_Y1_Z1     = 6 me_6'd13;
+    localparam ST_DBL_Y1_Z1     = 6'd13;
     localparam ST_DBL_Z3        = 6'd14;
     localparam ST_DBL_S_MINUS_X3= 6'd15;
     localparam ST_DBL_M_S_X3    = 6'd16;
@@ -108,7 +108,7 @@ module jacobian_point_op #(
     assign mult_b     = fsm_mult_b;
 
     // ------------------------------------------------------------------------
-    // Unidad Aritmética Modular Iterativa de 16 bits (ALU)
+    // Unidad Aritmética Modular de 256 bits (ALU Pipelined de 2 ciclos)
     // ------------------------------------------------------------------------
     reg                 alu_start;
     reg                 alu_op; // 0: ADD, 1: SUB
@@ -117,7 +117,7 @@ module jacobian_point_op #(
     wire                alu_done;
     wire [WIDTH-1:0]    alu_result;
 
-    mod_add_sub_16bit #(
+    mod_add_sub_256 #(
         .WIDTH(WIDTH)
     ) alu_inst (
         .clk(clk),
@@ -175,7 +175,9 @@ module jacobian_point_op #(
                 ST_CHECK_INF: begin
                     if (op_type == 1'b1) begin // Doubling
                         if (z1 == {WIDTH{1'b0}}) begin
-                            x3 <= {WIDTH{1'b0}}; y3 <= {WIDTH{1'b0}}; z3 <= {WIDTH{1'b0}};
+                            x3    <= {WIDTH{1'b0}};
+                            y3    <= {WIDTH{1'b0}};
+                            z3    <= {WIDTH{1'b0}};
                             state <= ST_DONE;
                         end else begin
                             fsm_mult_a     <= x1;
@@ -186,10 +188,14 @@ module jacobian_point_op #(
                         end
                     end else begin // Addition
                         if (z1 == {WIDTH{1'b0}}) begin
-                            x3 <= x2; y3 <= y2; z3 <= z2;
+                            x3    <= x2;
+                            y3    <= y2;
+                            z3    <= z2;
                             state <= ST_DONE;
                         end else if (z2 == {WIDTH{1'b0}}) begin
-                            x3 <= x1; y3 <= y1; z3 <= z1;
+                            x3    <= x1;
+                            y3    <= y1;
+                            z3    <= z1;
                             state <= ST_DONE;
                         end else begin
                             fsm_mult_a     <= z1;
@@ -417,7 +423,7 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_CALC_H: begin
-                    reg_a          <= alu_result; // H
+                    reg_a          <= alu_result; // H (se conserva en reg_a)
                     fsm_mult_a     <= z1;
                     fsm_mult_b     <= t1;         // Z1^2
                     fsm_mult_start <= 1'b1;
@@ -468,7 +474,9 @@ module jacobian_point_op #(
                         if (alu_result == {WIDTH{1'b0}}) begin
                             is_double <= 1'b1;
                         end
-                        x3 <= {WIDTH{1'b0}}; y3 <= {WIDTH{1'b0}}; z3 <= {WIDTH{1'b0}};
+                        x3    <= {WIDTH{1'b0}};
+                        y3    <= {WIDTH{1'b0}};
+                        z3    <= {WIDTH{1'b0}};
                         state <= ST_DONE;
                     end else begin
                         fsm_mult_a     <= reg_a; // H
@@ -517,7 +525,7 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_X3_PREP: begin
-                    reg_a          <= alu_result; // R^2 - H^3
+                    t3             <= alu_result; // R^2 - H^3
                     alu_a          <= t1;         // V + V = 2V
                     alu_b          <= t1;
                     alu_op         <= 1'b0;       // ADD
@@ -527,7 +535,7 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_2V: begin
-                    alu_a          <= reg_a;      // (R^2 - H^3) - 2V
+                    alu_a          <= t3;         // (R^2 - H^3) - 2V
                     alu_b          <= alu_result; // 2V
                     alu_op         <= 1'b1;       // SUB
                     alu_start      <= 1'b1;
@@ -582,8 +590,8 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_Z1_Z2: begin
-                    fsm_mult_a     <= mult_result;
-                    fsm_mult_b     <= reg_a; // H
+                    fsm_mult_a     <= mult_result; // Z1 * Z2
+                    fsm_mult_b     <= reg_a;       // H
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_Z3;
                     state          <= ST_MULT_WAIT;
@@ -625,14 +633,12 @@ module jacobian_point_op #(
 endmodule
 
 // ============================================================================
-// Submódulo Auxiliar: Sub-FSM Aritmética Modular Iterativa de 16 bits
+// Submódulo Auxiliar: ALU Modular Pipelined de 256 bits (2 ciclos de reloj)
 // Operación: op = 0 -> (A + B) mod P
 //            op = 1 -> (A - B) mod P
 // ============================================================================
-module mod_add_sub_16bit #(
-    parameter WIDTH     = 256,
-    parameter WORD_SIZE = 16,
-    parameter NUM_WORDS = WIDTH / WORD_SIZE
+module mod_add_sub_256 #(
+    parameter WIDTH = 256
 )(
     input  wire                 clk,
     input  wire                 rst_n,
@@ -645,137 +651,56 @@ module mod_add_sub_16bit #(
     output reg  [WIDTH-1:0]     result
 );
 
-    localparam ST_IDLE       = 3'd0;
-    localparam ST_ADD_P1     = 3'd1;
-    localparam ST_ADD_P2     = 3'd2;
-    localparam ST_SUB_DIRECT = 3'd3;
-    localparam ST_SUB_P1     = 3'd4;
-    localparam ST_SUB_P2     = 3'd5;
-    localparam ST_DONE       = 3'd6;
+    localparam ST_IDLE = 2'd0;
+    localparam ST_CALC = 2'd1;
+    localparam ST_DONE = 2'd2;
 
-    reg [2:0]           state;
-    reg [4:0]           idx;
-    reg                 carry_borrow;
-    reg [WIDTH-1:0]     t_reg;
-    reg                 t_carry;
-    reg [WORD_SIZE+1:0] calc_res; // Variable de cálculo de 18 bits para evitar 'wire' procedurales
-
-    wire [WORD_SIZE-1:0] a_w = a[idx*WORD_SIZE +: WORD_SIZE];
-    wire [WORD_SIZE-1:0] b_w = b[idx*WORD_SIZE +: WORD_SIZE];
-    wire [WORD_SIZE-1:0] p_w = p[idx*WORD_SIZE +: WORD_SIZE];
-    wire [WORD_SIZE-1:0] t_w = t_reg[idx*WORD_SIZE +: WORD_SIZE];
+    reg [1:0]       state;
+    reg             op_reg;
+    reg [WIDTH:0]   sum_raw;
+    reg [WIDTH:0]   sub_raw;
+    reg [WIDTH:0]   add_p_raw;
+    reg [WIDTH-1:0] p_reg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state        <= ST_IDLE;
-            done         <= 1'b0;
-            result       <= {WIDTH{1'b0}};
-            idx          <= 5'd0;
-            carry_borrow <= 1'b0;
-            t_reg        <= {WIDTH{1'b0}};
-            t_carry      <= 1'b0;
-            calc_res     <= {(WORD_SIZE+2){1'b0}};
+            state     <= ST_IDLE;
+            done      <= 1'b0;
+            result    <= {WIDTH{1'b0}};
+            op_reg    <= 1'b0;
+            sum_raw   <= {(WIDTH+1){1'b0}};
+            sub_raw   <= {(WIDTH+1){1'b0}};
+            add_p_raw <= {(WIDTH+1){1'b0}};
+            p_reg     <= {WIDTH{1'b0}};
         end else begin
             case (state)
                 ST_IDLE: begin
                     done <= 1'b0;
                     if (start) begin
-                        idx          <= 5'd0;
-                        carry_borrow <= 1'b0;
-                        if (op == 1'b0) begin // ADD
-                            state <= ST_ADD_P1;
-                        end else begin // SUB
-                            if (a >= b)
-                                state <= ST_SUB_DIRECT;
-                            else
-                                state <= ST_SUB_P1;
-                        end
+                        op_reg    <= op;
+                        p_reg     <= p;
+                        sum_raw   <= {1'b0, a} + {1'b0, b};
+                        sub_raw   <= {1'b0, a} - {1'b0, b};
+                        add_p_raw <= {1'b0, a} + {1'b0, p};
+                        state     <= ST_CALC;
                     end
                 end
 
-                // ------------------------------------------------------------
-                // SUMA MODULAR: Paso 1 (S = A + B)
-                // ------------------------------------------------------------
-                ST_ADD_P1: begin
-                    calc_res = a_w + b_w + carry_borrow;
-                    t_reg[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
-                    carry_borrow <= calc_res[WORD_SIZE];
-
-                    if (idx == NUM_WORDS - 1) begin
-                        idx          <= 5'd0;
-                        t_carry      <= calc_res[WORD_SIZE];
-                        carry_borrow <= 1'b0;
-                        state        <= ST_ADD_P2;
-                    end else begin
-                        idx <= idx + 1'b1;
-                    end
-                end
-
-                // ------------------------------------------------------------
-                // SUMA MODULAR: Paso 2 (Si S >= P, Result = S - P; en otro caso Result = S)
-                // ------------------------------------------------------------
-                ST_ADD_P2: begin
-                    if (t_carry || (t_reg >= p)) begin
-                        calc_res = {1'b0, t_w} - {1'b0, p_w} - carry_borrow;
-                        result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
-                        carry_borrow <= calc_res[WORD_SIZE+1];
-
-                        if (idx == NUM_WORDS - 1) begin
-                            state <= ST_DONE;
+                ST_CALC: begin
+                    if (op_reg == 1'b0) begin // ADD: (a + b) mod p
+                        if (sum_raw >= {1'b0, p_reg}) begin
+                            result <= sum_raw[WIDTH-1:0] - p_reg;
                         end else begin
-                            idx <= idx + 1'b1;
+                            result <= sum_raw[WIDTH-1:0];
                         end
-                    end else begin
-                        result <= t_reg;
-                        state  <= ST_DONE;
+                    end else begin // SUB: (a - b) mod p
+                        if (sub_raw[WIDTH] == 1'b0) begin // a >= b
+                            result <= sub_raw[WIDTH-1:0];
+                        end else begin // a < b
+                            result <= add_p_raw[WIDTH-1:0] - sub_raw[WIDTH-1:0];
+                        end
                     end
-                end
-
-                // ------------------------------------------------------------
-                // RESTA MODULAR (A >= B): Result = A - B
-                // ------------------------------------------------------------
-                ST_SUB_DIRECT: begin
-                    calc_res = {1'b0, a_w} - {1'b0, b_w} - carry_borrow;
-                    result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
-                    carry_borrow <= calc_res[WORD_SIZE+1];
-
-                    if (idx == NUM_WORDS - 1) begin
-                        state <= ST_DONE;
-                    end else begin
-                        idx <= idx + 1'b1;
-                    end
-                end
-
-                // ------------------------------------------------------------
-                // RESTA MODULAR (A < B): Paso 1 (T = A + P)
-                // ------------------------------------------------------------
-                ST_SUB_P1: begin
-                    calc_res = a_w + p_w + carry_borrow;
-                    t_reg[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
-                    carry_borrow <= calc_res[WORD_SIZE];
-
-                    if (idx == NUM_WORDS - 1) begin
-                        idx          <= 5'd0;
-                        carry_borrow <= 1'b0;
-                        state        <= ST_SUB_P2;
-                    end else begin
-                        idx <= idx + 1'b1;
-                    end
-                end
-
-                // ------------------------------------------------------------
-                // RESTA MODULAR (A < B): Paso 2 (Result = T - B)
-                // ------------------------------------------------------------
-                ST_SUB_P2: begin
-                    calc_res = {1'b0, t_w} - {1'b0, b_w} - carry_borrow;
-                    result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
-                    carry_borrow <= calc_res[WORD_SIZE+1];
-
-                    if (idx == NUM_WORDS - 1) begin
-                        state <= ST_DONE;
-                    end else begin
-                        idx <= idx + 1'b1;
-                    end
+                    state <= ST_DONE;
                 end
 
                 ST_DONE: begin
