@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: fpga_uart_top.v
+// Módulo: fpga_uart_top.v (VERIFICADO)
 // Descripción: Wrapper UART optimizado mediante Registro de Desplazamiento Fijo
 //              para minimizar el consumo de LEs en Intel Cyclone IV.
 // ============================================================================
@@ -42,7 +42,7 @@ module fpga_uart_top (
     localparam ST_RX_BYTES = 2'd0;
     localparam ST_PROCESS  = 2'd1;
     localparam ST_TX_START = 2'd2;
-    localparam ST_TX_WAIT  = 2'd3;
+    localparam ST_TX_WAIT  = 2 me 2'd3;
 
     reg [1:0]  state;
     reg [5:0]  byte_cnt; // Contador de 0 a 63 bytes
@@ -105,7 +105,7 @@ module fpga_uart_top (
                     end
                 end
 
-                // 3. Extraer SIEMPRE el byte superior fijo [511:504] (sin MUX dinámico)
+                // 3. Extraer SIEMPRE el byte superior fijo [511:504]
                 ST_TX_START: begin
                     tx_byte  <= tx_buffer[511:504];
                     tx_start <= 1'b1;

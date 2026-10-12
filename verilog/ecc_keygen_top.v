@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: ecc_keygen_top.v
+// Módulo: ecc_keygen_top.v (VERIFICADO Y OPTIMIZADO)
 // Descripción: Orquestador Top-Level y Banco Central de Registros para secp256k1.
 //              Gerencia el tiempo compartido del Operador Jacobiano Unificado
 //              (jacobian_point_op) y del Multiplicador de Montgomery.
@@ -27,7 +27,6 @@ module ecc_keygen_top #(
     // Parámetros de la Curva secp256k1 (Dominio Montgomery)
     // ------------------------------------------------------------------------
     localparam [WIDTH-1:0] SECP256K1_P = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
-    localparam [WIDTH-1:0] SECP256K1_A = 256'd0;
     localparam [15:0]      N_PRIME0    = 16'h2ECD; // (-P^-1) mod 2^16 para secp256k1
 
     // Generador G(x, y) codificado en Dominio Montgomery (G * R mod p)
@@ -69,13 +68,12 @@ module ecc_keygen_top #(
     wire [WINDOW_SIZE-2:0]  ram_raddr;
     wire [WIDTH-1:0]        ram_dout_x, ram_dout_y;
 
-    // Señales de salida independientes del Precomputador (evita múltiples drivers)
+    // Señales del Precomputador
     wire        precomp_dbl_start, precomp_add_start;
     wire [WIDTH-1:0] precomp_dbl_x1, precomp_dbl_y1, precomp_dbl_z1;
     wire [WIDTH-1:0] precomp_add_x1, precomp_add_y1, precomp_add_z1;
     wire [WIDTH-1:0] precomp_add_x2, precomp_add_y2, precomp_add_z2;
 
-    // Multiplexado interno de salidas del Precomputador
     wire        precomp_op_start;
     wire        precomp_op_type;
     wire [WIDTH-1:0] precomp_op_x1, precomp_op_y1, precomp_op_z1;
@@ -89,13 +87,12 @@ module ecc_keygen_top #(
     assign precomp_op_y2    = precomp_add_y2;
     assign precomp_op_z2    = precomp_add_z2;
 
-    // Señales de salida independientes del Motor de Ventana (evita múltiples drivers)
+    // Señales del Motor de Ventana
     wire        sw_add_start, sw_dbl_start;
     wire [WIDTH-1:0] sw_add_x1, sw_add_y1, sw_add_z1;
     wire [WIDTH-1:0] sw_add_x2, sw_add_y2, sw_add_z2;
     wire [WIDTH-1:0] sw_dbl_x1, sw_dbl_y1, sw_dbl_z1;
 
-    // Multiplexado interno de salidas del Motor de Ventana
     wire        sw_op_start;
     wire        sw_op_type;
     wire [WIDTH-1:0] sw_op_x1, sw_op_y1, sw_op_z1;
@@ -109,7 +106,7 @@ module ecc_keygen_top #(
     assign sw_op_y2    = sw_add_y2;
     assign sw_op_z2    = sw_add_z2;
 
-    // Señales del Operador Jacobiano Unificado (jacobian_point_op)
+    // Señales del Operador Jacobiano Unificado
     wire        op_start;
     wire        op_type;
     wire        op_done;
@@ -120,7 +117,7 @@ module ecc_keygen_top #(
     wire        op_mult_start;
     wire [WIDTH-1:0] op_mult_a, op_mult_b;
 
-    // Señales del Convertidor a Coordenadas Afines (domain_coordinate_converter)
+    // Señales del Convertidor a Coordenadas Afines
     wire        conv_mult_start;
     wire [WIDTH-1:0] conv_mult_a, conv_mult_b;
 
@@ -132,9 +129,8 @@ module ecc_keygen_top #(
     wire [WIDTH-1:0] mult_result;
 
     // ------------------------------------------------------------------------
-    // Multiplexado del Banco Central de Recursos Compartidos
+    // Multiplexado del Banco Central
     // ------------------------------------------------------------------------
-    // 1. Multiplexor para la Unidad Operativa Jacobiana (Add / Double)
     assign op_start = precomp_busy ? precomp_op_start : sw_op_start;
     assign op_type  = precomp_busy ? precomp_op_type  : sw_op_type;
     assign op_x1    = precomp_busy ? precomp_op_x1    : sw_op_x1;
@@ -144,16 +140,15 @@ module ecc_keygen_top #(
     assign op_y2    = precomp_busy ? precomp_op_y2    : sw_op_y2;
     assign op_z2    = precomp_busy ? precomp_op_z2    : sw_op_z2;
 
-    // 2. Multiplexor para el Multiplicador de Montgomery
     assign mult_start = op_busy ? op_mult_start : conv_mult_start;
     assign mult_a     = op_busy ? op_mult_a     : conv_mult_a;
     assign mult_b     = op_busy ? op_mult_b     : conv_mult_b;
 
     // ------------------------------------------------------------------------
-    // Instanciación de Submódulos de la Arquitectura
+    // Instanciación de Submódulos
     // ------------------------------------------------------------------------
 
-    // 1. Memoria RAM Dual-Port (Inferencia BRAM M9K)
+    // 1. Memoria RAM BRAM M9K
     ecc_point_ram #(
         .WIDTH(WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
@@ -168,7 +163,7 @@ module ecc_keygen_top #(
         .dout_y(ram_dout_y)
     );
 
-    // 2. Instancia de Precomputación
+    // 2. Precomputación
     ecc_precompute_fsm #(
         .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) precomp_inst (
@@ -187,7 +182,7 @@ module ecc_keygen_top #(
         .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3)
     );
 
-    // 3. Instancia del Motor de Ventana
+    // 3. Motor de Ventana
     ecc_sliding_window_engine #(
         .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) sw_engine_inst (
@@ -206,7 +201,7 @@ module ecc_keygen_top #(
         .x_out(sw_x), .y_out(sw_y), .z_out(sw_z)
     );
     
-    // 4. Operador Geométrico Jacobiano Unificado
+    // 4. Operador Jacobiano Unificado
     jacobian_point_op #(
         .WIDTH(WIDTH)
     ) point_op_inst (
@@ -234,7 +229,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 5. Multiplicador de Montgomery Físico Único
+    // 5. Multiplicador de Montgomery Compartido
     montgomery_multiplier #(
         .WIDTH(WIDTH)
     ) mont_mult_inst (
@@ -250,7 +245,7 @@ module ecc_keygen_top #(
         .result(mult_result)
     );
 
-    // 6. Conversor de Dominio Jacobianas-Montgomery a Afines Normales
+    // 6. Conversor a Coordenadas Afines Normales
     domain_coordinate_converter #(
         .WIDTH(WIDTH)
     ) domain_conv_inst (
@@ -273,7 +268,7 @@ module ecc_keygen_top #(
     );
 
     // ------------------------------------------------------------------------
-    // FSM Principal de Secuenciación Criptográfica
+    // FSM Principal
     // ------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -296,7 +291,6 @@ module ecc_keygen_top #(
                     end
                 end
 
-                // 1. Generar la tabla de 32 puntos impares en RAM
                 ST_PRECOMPUTE: begin
                     precomp_start <= 1'b0;
                     if (precomp_done) begin
@@ -305,7 +299,6 @@ module ecc_keygen_top #(
                     end
                 end
 
-                // 2. Ejecutar k*G en coordenadas Jacobianas Montgomery
                 ST_SCALAR_MULT: begin
                     sw_start <= 1'b0;
                     if (sw_done) begin
@@ -314,7 +307,6 @@ module ecc_keygen_top #(
                     end
                 end
 
-                // 3. Convertir de Jacobianas a Coordenadas Afines Normales
                 ST_CONVERT: begin
                     conv_start <= 1'b0;
                     if (conv_done) begin

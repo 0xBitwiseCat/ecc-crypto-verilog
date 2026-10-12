@@ -1,6 +1,7 @@
 // ============================================================================
-// Módulo: uart_tx.v
-// Descripción: Transmisor UART RS-232 genérico
+// Módulo: uart_tx.v (CORREGIDO)
+// Descripción: Transmisor UART RS-232 con respuesta combinacional en busy
+//              para eliminar condiciones de carrera con la FSM Top.
 // ============================================================================
 
 module uart_tx #(
@@ -12,7 +13,7 @@ module uart_tx #(
     output reg        tx,
     input  wire [7:0] data_in,
     input  wire       start,
-    output reg        busy
+    output wire       busy     // Salida combinacional directa
 );
 
     localparam CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
@@ -27,22 +28,23 @@ module uart_tx #(
     reg [2:0]  bit_idx;
     reg [7:0]  tx_shift;
 
+    // Respuesta inmediata a 'start' para evitar lecturas en falso de 'busy'
+    assign busy = (state != ST_IDLE) || start;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state   <= ST_IDLE;
-            tx      <= 1'b1;
-            busy    <= 1'b0;
-            clk_cnt <= 16'd0;
-            bit_idx <= 3'd0;
+            state    <= ST_IDLE;
+            tx       <= 1'b1;
+            clk_cnt  <= 16'd0;
+            bit_idx  <= 3'd0;
+            tx_shift <= 8'd0;
         end else begin
             case (state)
                 ST_IDLE: begin
                     tx      <= 1'b1;
-                    busy    <= 1'b0;
                     clk_cnt <= 16'd0;
                     bit_idx <= 3'd0;
                     if (start) begin
-                        busy     <= 1'b1;
                         tx_shift <= data_in;
                         state    <= ST_START;
                     end
@@ -59,7 +61,7 @@ module uart_tx #(
                 end
 
                 ST_DATA: begin
-                    tx <= tx_shift[bit_idx]; // Salida LSB primero
+                    tx <= tx_shift[bit_idx]; // LSB primero
                     if (clk_cnt < CLKS_PER_BIT - 1) begin
                         clk_cnt <= clk_cnt + 1'b1;
                     end else begin
@@ -78,11 +80,12 @@ module uart_tx #(
                     if (clk_cnt < CLKS_PER_BIT - 1) begin
                         clk_cnt <= clk_cnt + 1'b1;
                     end else begin
-                        busy    <= 1'b0;
                         clk_cnt <= 16'd0;
                         state   <= ST_IDLE;
                     end
                 end
+
+                default: state <= ST_IDLE;
             endcase
         end
     end

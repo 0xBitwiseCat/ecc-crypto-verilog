@@ -1,8 +1,8 @@
 // ============================================================================
-// Módulo: domain_coordinate_converter.v
+// Módulo: domain_coordinate_converter.v (CORREGIDO)
 // Descripción: Conversión de Coordenadas Jacobianas Montgomery (X, Y, Z) 
 //              a Coordenadas Afines Normales (Qx, Qy) para secp256k1.
-// Optimizado para: Intel Cyclone IV (Reutilización de registros de 256 bits)
+// Optimizado para: Intel Cyclone IV
 // ============================================================================
 
 module domain_coordinate_converter #(
@@ -34,30 +34,26 @@ module domain_coordinate_converter #(
     input  wire [WIDTH-1:0]     mult_result
 );
 
-    // Constante R^3 mod p para secp256k1 (usada para convertir z_inv a dominio Montgomery)
-    localparam [WIDTH-1:0] R3_MOD_P = 256'h100000B7300000B7300000001;
-
     // ------------------------------------------------------------------------
     // Codificación de Estados de la FSM
     // ------------------------------------------------------------------------
     localparam ST_IDLE        = 4'd0;
     localparam ST_CHECK_Z     = 4'd1;
     localparam ST_WAIT_INV    = 4'd2;
-    localparam ST_CALC_ZINV_M = 4'd3;
-    localparam ST_CALC_ZINV2  = 4'd4;
-    localparam ST_CALC_ZINV3  = 4'd5;
-    localparam ST_CALC_X_MONT = 4'd6;
-    localparam ST_CALC_Y_MONT = 4'd7;
-    localparam ST_CALC_X_NORM = 4'd8;
-    localparam ST_CALC_Y_NORM = 4'd9;
-    localparam ST_MULT_WAIT   = 4'd10;
-    localparam ST_DONE        = 4'd11;
+    localparam ST_CALC_ZINV2  = 4'd3;
+    localparam ST_CALC_ZINV3  = 4'd4;
+    localparam ST_CALC_X_MONT = 4'd5;
+    localparam ST_CALC_Y_MONT = 4'd6;
+    localparam ST_CALC_X_NORM = 4'd7;
+    localparam ST_CALC_Y_NORM = 4'd8;
+    localparam ST_MULT_WAIT   = 4'd9;
+    localparam ST_DONE        = 4'd10;
 
     reg [3:0] state, next_state;
 
-    // Solo 2 registros temporales de 256 bits (reutilizados dinámicamente)
-    reg [WIDTH-1:0] temp_a;
-    reg [WIDTH-1:0] temp_b;
+    // Registros temporales reutilizados dinámicamente
+    reg [WIDTH-1:0] temp_a; // Almacena Z_inv_mont, luego Z_inv3_mont
+    reg [WIDTH-1:0] temp_b; // Almacena Z_inv2_mont, luego Y_mont
 
     // Control de FSM para Multiplicación
     reg             fsm_mult_start;
@@ -126,22 +122,14 @@ module domain_coordinate_converter #(
                     end
                 end
 
-                // Evaluar casos especiales Z = 0 o Z = 1
+                // Evaluar punto al infinito Z = 0
                 ST_CHECK_Z: begin
                     if (z_in == {WIDTH{1'b0}}) begin
                         x_out <= {WIDTH{1'b0}};
-                        y_out <= {WIDTH{1'b0}};
+                        y_out <= {WIDTH{1 me 1'b0}};
                         state <= ST_DONE;
-                    end else if (z_in == 256'd1) begin
-                        // Z = 1: Convertir X_in y Y_in directamente fuera de Montgomery
-                        fsm_mult_a     <= x_in;
-                        fsm_mult_b     <= 256'd1; // MontMult(X_mont, 1) = X_norm
-                        fsm_mult_start <= 1'b1;
-                        temp_b         <= y_in;   // Almacenar Y_in temporalmente
-                        next_state     <= ST_CALC_X_NORM;
-                        state          <= ST_MULT_WAIT;
                     end else begin
-                        // Iniciar inversión modular de Z_in
+                        // Iniciar inversión modular de Z_in (z_inv_raw = Z^-1 * R mod p)
                         inv_start <= 1'b1;
                         state     <= ST_WAIT_INV;
                     end
@@ -149,32 +137,22 @@ module domain_coordinate_converter #(
 
                 // Esperar a que el inversor de Fermat complete Z_inv
                 ST_WAIT_INV: begin
-                    inv_start <= 1'b0;
+                    inv_start <= 1 me 1'b0;
                     if (inv_done) begin
-                        // Convertir z_inv_raw a Dominio Montgomery
+                        temp_a         <= z_inv_raw; // temp_a = Z_inv_mont
+                        // Calcular Z_inv2_mont = MontMult(Z_inv_mont, Z_inv_mont)
                         fsm_mult_a     <= z_inv_raw;
-                        fsm_mult_b     <= R3_MOD_P;
+                        fsm_mult_b     <= z_inv_raw;
                         fsm_mult_start <= 1'b1;
-                        next_state     <= ST_CALC_ZINV_M;
+                        next_state     <= ST_CALC_ZINV2;
                         state          <= ST_MULT_WAIT;
                     end
-                end
-
-                // mult_result = Z_inv_mont
-                ST_CALC_ZINV_M: begin
-                    temp_a         <= mult_result; // temp_a = Z_inv_mont
-                    // Z_inv2_mont = Z_inv_mont^2 mod p
-                    fsm_mult_a     <= mult_result;
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_CALC_ZINV2;
-                    state          <= ST_MULT_WAIT;
                 end
 
                 // mult_result = Z_inv2_mont
                 ST_CALC_ZINV2: begin
                     temp_b         <= mult_result; // temp_b = Z_inv2_mont
-                    // Z_inv3_mont = Z_inv2_mont * Z_inv_mont mod p
+                    // Calcular Z_inv3_mont = MontMult(Z_inv2_mont, Z_inv_mont)
                     fsm_mult_a     <= mult_result;
                     fsm_mult_b     <= temp_a;      // temp_a = Z_inv_mont
                     fsm_mult_start <= 1'b1;
@@ -185,7 +163,7 @@ module domain_coordinate_converter #(
                 // mult_result = Z_inv3_mont
                 ST_CALC_ZINV3: begin
                     temp_a         <= mult_result; // temp_a = Z_inv3_mont
-                    // X_mont = X_in * Z_inv2_mont mod p
+                    // X_mont = MontMult(X_in, Z_inv2_mont)
                     fsm_mult_a     <= x_in;
                     fsm_mult_b     <= temp_b;      // temp_b = Z_inv2_mont
                     fsm_mult_start <= 1'b1;
@@ -195,8 +173,8 @@ module domain_coordinate_converter #(
 
                 // mult_result = X_mont
                 ST_CALC_X_MONT: begin
-                    x_out          <= mult_result; // Reutilizar x_out para guardar X_mont
-                    // Y_mont = Y_in * Z_inv3_mont mod p
+                    x_out          <= mult_result; // Guardar X_mont temporalmente en x_out
+                    // Y_mont = MontMult(Y_in, Z_inv3_mont)
                     fsm_mult_a     <= y_in;
                     fsm_mult_b     <= temp_a;      // temp_a = Z_inv3_mont
                     fsm_mult_start <= 1'b1;
@@ -207,7 +185,7 @@ module domain_coordinate_converter #(
                 // mult_result = Y_mont
                 ST_CALC_Y_MONT: begin
                     temp_b         <= mult_result; // temp_b = Y_mont
-                    // Convertir X_mont a Afín Normal: X_out = MontMult(X_mont, 1)
+                    // Convertir X_mont a Afín Normal: X_norm = MontMult(X_mont, 1)
                     fsm_mult_a     <= x_out;       // x_out contiene X_mont
                     fsm_mult_b     <= 256'd1;
                     fsm_mult_start <= 1'b1;
@@ -217,8 +195,8 @@ module domain_coordinate_converter #(
 
                 // mult_result = X_norm (Final)
                 ST_CALC_X_NORM: begin
-                    x_out          <= mult_result; // X_norm final guardado en x_out
-                    // Convertir Y_mont a Afín Normal: Y_out = MontMult(Y_mont, 1)
+                    x_out          <= mult_result; // X_norm guardado finalmente en x_out
+                    // Convertir Y_mont a Afín Normal: Y_norm = MontMult(Y_mont, 1)
                     fsm_mult_a     <= temp_b;      // temp_b contiene Y_mont
                     fsm_mult_b     <= 256'd1;
                     fsm_mult_start <= 1'b1;

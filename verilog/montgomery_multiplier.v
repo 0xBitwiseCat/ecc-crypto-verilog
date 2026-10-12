@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: montgomery_multiplier.v
+// Módulo: montgomery_multiplier.v (CORREGIDO)
 // Algoritmo: CIOS Montgomery Multiplication (Word-Based, W = 16 bits)
 // Optimizado para: Intel Cyclone IV (Inferencia nativa de DSP 18x18)
 // Operación: Result = (A * B * R^-1) mod P
@@ -31,38 +31,40 @@ module montgomery_multiplier #(
 );
 
     // ------------------------------------------------------------------------
-    // Estados de la FSM
+    // Estados de la FSM (Codificación Única)
     // ------------------------------------------------------------------------
-    localparam ST_IDLE       = 3'b000;
-    localparam ST_MULT_ACC   = 3'b001;
-    localparam ST_M_CALC     = 3'b010;
-    localparam ST_REDUCE     = 3'b011;
-    localparam ST_NEXT_WORD  = 3'b100;
-    localparam ST_FINAL_SUB  = 3'b01;
-    localparam ST_DONE       = 3'b110;
+    localparam ST_IDLE       = 3'd0;
+    localparam ST_MULT_ACC   = 3'd1;
+    localparam ST_M_CALC     = 3'd2;
+    localparam ST_REDUCE     = 3'd3;
+    localparam ST_NEXT_WORD  = 3'd4;
+    localparam ST_FINAL_SUB  = 3'd5;
+    localparam ST_DONE       = 3'd6;
 
     reg [2:0] state;
 
     // ------------------------------------------------------------------------
     // Registros Internos y Acumuladores
     // ------------------------------------------------------------------------
-    reg [WORD_SIZE-1:0] t [0:NUM_WORDS]; // Memoria temporal T (17 palabras de 16 bits)
-    reg [35:0]          acc;              // Acumulador de 36 bits
-    reg [WORD_SIZE-1:0] m;                // Factor m
+    reg [WORD_SIZE-1:0] t [0:NUM_WORDS]; // Memoria temporal T (17 palabras)
+    reg [35:0]          carry;           // Acumulador de acarreo de 36 bits
+    reg [WORD_SIZE-1:0] m;               // Factor m
     
     // Índices de bucles
     reg [4:0] i; // Índice palabra exterior (0 a 15)
-    reg [4:0] j; // Índice palabra interior (0 a 15)
+    reg [4:0] j; // Índice palabra interior (0 a 16)
 
-    // Extracción de palabras de entrada
+    // Extracción segura de palabras de entrada con protección de rango
     wire [WORD_SIZE-1:0] a_word = a[i*WORD_SIZE +: WORD_SIZE];
-    wire [WORD_SIZE-1:0] b_word = b[j*WORD_SIZE +: WORD_SIZE];
-    wire [WORD_SIZE-1:0] p_word = p[j*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] b_word = (j < NUM_WORDS) ? b[j*WORD_SIZE +: WORD_SIZE] : {WORD_SIZE{1'b0}};
+    wire [WORD_SIZE-1:0] p_word = (j < NUM_WORDS) ? p[j*WORD_SIZE +: WORD_SIZE] : {WORD_SIZE{1'b0}};
 
-    // Signals intermedias de 16 bits explícitas para eliminar el Warning (10230)
-    wire [WORD_SIZE-1:0] acc_low  = acc[WORD_SIZE-1:0];
-    wire [WORD_SIZE-1:0] acc_high = acc[2*WORD_SIZE-1 : WORD_SIZE]; // acc[31:16]
-    wire [31:0]          m_prod   = t[0] * n_prime0;
+    // Cálculos combinacionales intermediarios para evitar condiciones de carrera
+    wire [35:0] mult_sum  = t[j] + (a_word * b_word) + carry;
+    wire [35:0] mult_last = t[NUM_WORDS] + carry;
+    wire [35:0] red_sum0  = t[0] + (m * p_word);
+    wire [35:0] red_sum   = t[j] + (m * p_word) + carry;
+    wire [35:0] red_last  = t[NUM_WORDS] + carry;
 
     integer k;
 
@@ -71,14 +73,14 @@ module montgomery_multiplier #(
     // ------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state   <= ST_IDLE;
-            done    <= 1'b0;
-            busy    <= 1'b0;
-            result  <= {WIDTH{1'b0}};
-            i       <= 5'd0;
-            j       <= 5'd0;
-            acc     <= 36'd0;
-            m       <= {WORD_SIZE{1'b0}};
+            state  <= ST_IDLE;
+            done   <= 1'b0;
+            busy   <= 1'b0;
+            result <= {WIDTH{1'b0}};
+            i      <= 5'd0;
+            j      <= 5'd0;
+            carry  <= 36'd0;
+            m      <= {WORD_SIZE{1'b0}};
             for (k = 0; k <= NUM_WORDS; k = k + 1) begin
                 t[k] <= {WORD_SIZE{1'b0}};
             end
@@ -91,7 +93,7 @@ module montgomery_multiplier #(
                         busy  <= 1'b1;
                         i     <= 5'd0;
                         j     <= 5'd0;
-                        acc   <= 36'd0;
+                        carry <= 36'd0;
                         for (k = 0; k <= NUM_WORDS; k = k + 1) begin
                             t[k] <= {WORD_SIZE{1'b0}};
                         end
@@ -103,75 +105,77 @@ module montgomery_multiplier #(
 
                 // Paso 1: Acumular A[i] * B[j]
                 ST_MULT_ACC: begin
-                    acc  <= t[j] + (a_word * b_word) + {16'd0, acc_high};
-                    t[j] <= acc_low; // Coincidencia exacta de 16 bits
-
-                    if (j == NUM_WORDS - 1) begin
-                        j     <= 5'd0;
-                        state <= ST_M_CALC;
-                    end else begin
+                    if (j < NUM_WORDS) begin
+                        t[j]  <= mult_sum[15:0];
+                        carry <= mult_sum[35:16];
                         j     <= j + 1'b1;
+                    end else begin
+                        // j == NUM_WORDS (16)
+                        t[NUM_WORDS] <= mult_last[15:0];
+                        carry        <= 36'd0;
+                        j            <= 5'd0;
+                        state        <= ST_M_CALC;
                     end
                 end
 
                 // Paso 2: Calcular factor de reducción m
                 ST_M_CALC: begin
-                    acc          <= t[NUM_WORDS] + {16'd0, acc_high};
-                    t[NUM_WORDS] <= acc_low;
-                    m            <= m_prod[WORD_SIZE-1:0]; // Slicing explícito a 16 bits
-                    j            <= 5'd0;
-                    state        <= ST_REDUCE;
+                    m     <= t[0] * n_prime0;
+                    carry <= 36'd0;
+                    j     <= 5'd0;
+                    state <= ST_REDUCE;
                 end
 
                 // Paso 3: Reducción m * P[j] + T[j]
                 ST_REDUCE: begin
-                    acc <= t[j] + (m * p_word) + {16'd0, acc_high};
-                    
-                    if (j > 0) begin
-                        t[j-1] <= acc_low; // Asignación directa wire 16-bit a reg 16-bit
-                    end
-
-                    if (j == NUM_WORDS - 1) begin
-                        j     <= 5'd0;
-                        state <= ST_NEXT_WORD;
+                    if (j == 5'd0) begin
+                        carry <= red_sum0[35:16]; // Descarte implícito del byte bajo (Shift Right)
+                        j     <= 5'd1;
+                    end else if (j < NUM_WORDS) begin
+                        t[j-1] <= red_sum[15:0];  // Almacenar palabra desplazada
+                        carry  <= red_sum[35:16];
+                        j      <= j + 1'b1;
                     end else begin
-                        j     <= j + 1'b1;
+                        // j == NUM_WORDS (16)
+                        t[NUM_WORDS-1] <= red_last[15:0];
+                        t[NUM_WORDS]   <= red_last[31:16];
+                        carry          <= 36'd0;
+                        j              <= 5'd0;
+                        state          <= ST_NEXT_WORD;
                     end
                 end
 
-                // Paso 4: Desplazamiento final y cambio de palabra
+                // Paso 4: Cambiar de palabra exterior A[i]
                 ST_NEXT_WORD: begin
-                    acc            <= t[NUM_WORDS] + {16'd0, acc_high};
-                    t[NUM_WORDS-1] <= acc_low;
-                    t[NUM_WORDS]   <= acc_high; // Asignación directa 16-bit
-
                     if (i == NUM_WORDS - 1) begin
                         state <= ST_FINAL_SUB;
                     end else begin
                         i     <= i + 1'b1;
-                        acc   <= 36'd0;
+                        j     <= 5'd0;
+                        carry <= 36'd0;
                         state <= ST_MULT_ACC;
                     end
                 end
 
                 // Paso 5: Resta condicional T >= P
                 ST_FINAL_SUB: begin
-                    begin: build_res
-                        reg [WIDTH:0] temp_t;
-                        reg [WIDTH:0] temp_sub;
+                    begin : build_res
+                        reg [256:0] temp_t;
+                        reg [256:0] temp_sub;
                         integer x;
-                        temp_t = 0;
+                        
+                        temp_t = 257'd0;
                         for (x = 0; x < NUM_WORDS; x = x + 1) begin
                             temp_t[x*WORD_SIZE +: WORD_SIZE] = t[x];
                         end
-                        temp_t[WIDTH] = t[NUM_WORDS][0];
+                        temp_t[256] = t[NUM_WORDS][0];
 
-                        temp_sub = temp_t - p;
+                        temp_sub = temp_t - {1'b0, p};
 
-                        if (temp_t >= p) begin
-                            result <= temp_sub[WIDTH-1:0];
+                        if (temp_t >= {1'b0, p}) begin
+                            result <= temp_sub[255:0];
                         end else begin
-                            result <= temp_t[WIDTH-1:0];
+                            result <= temp_t[255:0];
                         end
                     end
                     state <= ST_DONE;

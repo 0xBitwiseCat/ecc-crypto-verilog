@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: fermat_inverter.v (Genérico / Curve-Agnostic)
+// Módulo: fermat_inverter.v (CORREGIDO)
 // Algoritmo: Exponenciación Binaria Left-to-Right (Square-and-Multiply)
 // Operación: Result = A^(P-2) mod P
 // Optimizado para: Intel Cyclone IV (Reutiliza el multiplicador externo)
@@ -32,14 +32,14 @@ module fermat_inverter #(
     // ------------------------------------------------------------------------
     // Estados FSM
     // ------------------------------------------------------------------------
-    localparam ST_IDLE      = 3'b000;
-    localparam ST_INIT      = 3'b001;
-    localparam ST_SQR_START = 3'b010;
-    localparam ST_SQR_WAIT  = 3'b011;
-    localparam ST_MUL_CHECK = 3'b100;
-    localparam ST_MUL_START = 3'b101;
-    localparam ST_MUL_WAIT  = 3'b110;
-    localparam ST_DONE      = 3'b111;
+    localparam ST_IDLE      = 3'd0;
+    localparam ST_INIT      = 3'd1;
+    localparam ST_SQR_START = 3'd2;
+    localparam ST_SQR_WAIT  = 3'd3;
+    localparam ST_MUL_CHECK = 3'd4;
+    localparam ST_MUL_START = 3'd5;
+    localparam ST_MUL_WAIT  = 3'd6;
+    localparam ST_DONE      = 3'd7;
 
     reg [2:0] state;
 
@@ -55,8 +55,8 @@ module fermat_inverter #(
     // ------------------------------------------------------------------------
     // Detector combinacional de la posición del bit más significativo (MSB)
     // ------------------------------------------------------------------------
-    integer i;
     reg [7:0] msb_pos;
+    integer i;
     always @(*) begin
         msb_pos = 8'd0;
         for (i = 0; i < WIDTH; i = i + 1) begin
@@ -86,7 +86,8 @@ module fermat_inverter #(
             case (state)
 
                 ST_IDLE: begin
-                    done <= 1'b0;
+                    done       <= 1'b0;
+                    mult_start <= 1'b0;
                     if (start) begin
                         busy     <= 1'b1;
                         a_reg    <= a;
@@ -99,9 +100,13 @@ module fermat_inverter #(
 
                 // Detectar el MSB de P-2 e iniciar el acumulador con 'a'
                 ST_INIT: begin
-                    acc     <= a_reg;
-                    bit_cnt <= msb_pos - 1'b1;
-                    state   <= ST_SQR_START;
+                    acc <= a_reg;
+                    if (msb_pos == 8'd0) begin
+                        state <= ST_DONE;
+                    end else begin
+                        bit_cnt <= msb_pos - 1'b1;
+                        state   <= ST_SQR_START;
+                    end
                 end
 
                 // ------------------------------------------------------------

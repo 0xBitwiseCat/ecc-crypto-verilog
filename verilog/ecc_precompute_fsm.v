@@ -1,6 +1,6 @@
 // ============================================================================
-// Módulo: ecc_precompute_fsm.v
-// Descripción: FSM para precomputación de la tabla de puntos impares
+// Módulo: ecc_precompute_fsm.v (CORREGIDO)
+// Descripción: FSM para precomputación de la tabla de 32 puntos impares (1G..63G)
 //              usada en el algoritmo Sliding Window (w=6).
 // Optimizado para: Intel Cyclone IV
 // ============================================================================
@@ -43,7 +43,8 @@ module ecc_precompute_fsm #(
     input  wire [WIDTH-1:0]           add_x3, add_y3, add_z3
 );
 
-    localparam NUM_POINTS = 1 << (WINDOW_SIZE - 2); // 16 puntos impares
+    // Corregido: 32 puntos impares para w=6 (addresses 0 a 31)
+    localparam NUM_POINTS = 1 << (WINDOW_SIZE - 1); // 32 puntos (1G..63G)
 
     // Codificación de Estados
     localparam ST_IDLE      = 3'd0;
@@ -54,13 +55,12 @@ module ecc_precompute_fsm #(
     localparam ST_WAIT_ADD  = 3'd5;
     localparam ST_DONE      = 3'd6;
 
-    reg [2:0] state;
-    reg [WINDOW_SIZE-2:0] point_idx;
+    reg [2:0]             state;
+    reg [WINDOW_SIZE-2:0] point_idx; // 5 bits (0 a 31)
 
     // Registros temporales para 2G
     reg [WIDTH-1:0] g2_x, g2_y, g2_z;
 
-    // Generación de op_type usando las constantes válidas de este módulo
     assign op_type = (state == ST_CALC_2G || state == ST_WAIT_2G) ? 1'b1 : 1'b0;
 
     always @(posedge clk or negedge rst_n) begin
@@ -96,10 +96,10 @@ module ecc_precompute_fsm #(
                     end
                 end
 
-                // 1. Guardar 1G en la primera posición de RAM
+                // 1. Guardar 1G en la posición 0 de la RAM
                 ST_STORE_G: begin
                     ram_we    <= 1'b1;
-                    ram_waddr <= {(WINDOW_SIZE-1){1'b0}};
+                    ram_waddr <= 5'd0;
                     ram_din_x <= gx_mont;
                     ram_din_y <= gy_mont;
 
@@ -143,13 +143,13 @@ module ecc_precompute_fsm #(
 
                 ST_WAIT_ADD: begin
                     if (add_done) begin
-                        // Guardar el punto impar calculado
+                        // Guardar el punto impar calculado en RAM
                         ram_we    <= 1'b1;
                         ram_waddr <= point_idx;
                         ram_din_x <= add_x3;
                         ram_din_y <= add_y3;
 
-                        if (point_idx == (NUM_POINTS - 1)) begin
+                        if (point_idx == (NUM_POINTS - 1)) begin // 31
                             state <= ST_DONE;
                         end else begin
                             point_idx <= point_idx + 1'b1;
@@ -169,6 +169,7 @@ module ecc_precompute_fsm #(
                 ST_DONE: begin
                     ram_we <= 1'b0;
                     done   <= 1'b1;
+                    busy   <= 1 me 1'b0;
                     busy   <= 1'b0;
                     state  <= ST_IDLE;
                 end

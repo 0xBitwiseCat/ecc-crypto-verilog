@@ -1,9 +1,8 @@
 // ============================================================================
-// Módulo: jacobian_point_op.v
+// Módulo: jacobian_point_op.v (CORREGIDO)
 // Descripción: Operador Geométrico-Jacobiano Unificado (Adición y Doblamiento)
 //              para secp256k1 (a=0) en Dominio Montgomery.
 // Optimización: ALU Modular Pipelined de 256 bits en 2 ciclos.
-//               Evita la poda de lógica (logic pruning) de Quartus.
 // Optimizado para: Intel Cyclone IV (EP4CE6E22C8)
 // ============================================================================
 
@@ -659,30 +658,27 @@ module mod_add_sub_256 #(
     reg             op_reg;
     reg [WIDTH:0]   sum_raw;
     reg [WIDTH:0]   sub_raw;
-    reg [WIDTH:0]   add_p_raw;
     reg [WIDTH-1:0] p_reg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state     <= ST_IDLE;
-            done      <= 1'b0;
-            result    <= {WIDTH{1'b0}};
-            op_reg    <= 1'b0;
-            sum_raw   <= {(WIDTH+1){1'b0}};
-            sub_raw   <= {(WIDTH+1){1'b0}};
-            add_p_raw <= {(WIDTH+1){1'b0}};
-            p_reg     <= {WIDTH{1'b0}};
+            state   <= ST_IDLE;
+            done    <= 1'b0;
+            result  <= {WIDTH{1'b0}};
+            op_reg  <= 1'b0;
+            sum_raw <= {(WIDTH+1){1'b0}};
+            sub_raw <= {(WIDTH+1){1'b0}};
+            p_reg   <= {WIDTH{1'b0}};
         end else begin
             case (state)
                 ST_IDLE: begin
                     done <= 1'b0;
                     if (start) begin
-                        op_reg    <= op;
-                        p_reg     <= p;
-                        sum_raw   <= {1'b0, a} + {1'b0, b};
-                        sub_raw   <= {1'b0, a} - {1'b0, b};
-                        add_p_raw <= {1'b0, a} + {1'b0, p};
-                        state     <= ST_CALC;
+                        op_reg  <= op;
+                        p_reg   <= p;
+                        sum_raw <= {1'b0, a} + {1'b0, b};
+                        sub_raw <= {1'b0, a} - {1'b0, b};
+                        state   <= ST_CALC;
                     end
                 end
 
@@ -697,7 +693,7 @@ module mod_add_sub_256 #(
                         if (sub_raw[WIDTH] == 1'b0) begin // a >= b
                             result <= sub_raw[WIDTH-1:0];
                         end else begin // a < b
-                            result <= add_p_raw[WIDTH-1:0] - sub_raw[WIDTH-1:0];
+                            result <= sub_raw[WIDTH-1:0] + p_reg; // Corrección matemática
                         end
                     end
                     state <= ST_DONE;

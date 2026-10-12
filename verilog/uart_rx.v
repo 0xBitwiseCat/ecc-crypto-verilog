@@ -1,11 +1,11 @@
 // ============================================================================
-// Módulo: uart_rx.v
-// Descripción: Receptor UART RS-232 genérico (8 bits, 1 bit stop, sin paridad)
+// Módulo: uart_rx.v (CORREGIDO)
+// Descripción: Receptor UART RS-232 con filtro contra framing errors.
 // ============================================================================
 
 module uart_rx #(
-    parameter CLK_FREQ  = 50000000, // Frecuencia del reloj principal (50 MHz)
-    parameter BAUD_RATE = 115200    // Velocidad de transmisión UART
+    parameter CLK_FREQ  = 50000000,
+    parameter BAUD_RATE = 115200
 )(
     input  wire       clk,
     input  wire       rst_n,
@@ -26,7 +26,7 @@ module uart_rx #(
     reg [2:0]  bit_idx;
     reg [7:0]  rx_shift;
 
-    // Sincronización de doble registro para evitar metaestabilidad en el pin RX
+    // Sincronización de doble registro para evitar metaestabilidad
     reg rx_sync1, rx_sync;
     always @(posedge clk) begin
         rx_sync1 <= rx;
@@ -40,6 +40,7 @@ module uart_rx #(
             clk_cnt  <= 16'd0;
             bit_idx  <= 3'd0;
             data_out <= 8'd0;
+            rx_shift <= 8'd0;
         end else begin
             case (state)
                 ST_IDLE: begin
@@ -81,12 +82,17 @@ module uart_rx #(
                     if (clk_cnt < CLKS_PER_BIT - 1) begin
                         clk_cnt <= clk_cnt + 1'b1;
                     end else begin
-                        data_out <= rx_shift;
-                        valid    <= 1'b1;
-                        clk_cnt  <= 16'd0;
-                        state    <= ST_IDLE;
+                        clk_cnt <= 16'd0;
+                        state   <= ST_IDLE;
+                        // Validación del bit de parada antes de confirmar el dato
+                        if (rx_sync) begin
+                            data_out <= rx_shift;
+                            valid    <= 1'b1;
+                        end
                     end
                 end
+
+                default: state <= ST_IDLE;
             endcase
         end
     end
