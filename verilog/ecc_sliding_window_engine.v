@@ -1,5 +1,7 @@
 // ============================================================================
-// Módulo: ecc_sliding_window_engine.v (Sin errores de sintaxis)
+// Módulo: ecc_sliding_window_engine.v
+// Descripción: Orquestador FSM para multiplicación escalar k*G usando
+//              Coordenadas Jacobianas en Dominio Montgomery.
 // ============================================================================
 
 module ecc_sliding_window_engine #(
@@ -9,114 +11,138 @@ module ecc_sliding_window_engine #(
     input  wire                       clk,
     input  wire                       rst_n,
 
+    // Control
     input  wire                       start,
     output reg                        done,
     output reg                        busy,
 
+    // Datos
     input  wire [WIDTH-1:0]           k_scalar,
     input  wire [WIDTH-1:0]           p,
 
+    // Interfaz con RAM de Puntos Precomputados
     output reg  [WINDOW_SIZE-2:0]     ram_raddr,
-    input  wire [WIDTH-1:0]           ram_dout,
+    input  wire [WIDTH-1:0]           ram_dout_x,
+    input  wire [WIDTH-1:0]           ram_dout_y,
 
+    // Interfaz de Control con jacobian_point_add
+    output reg                        add_start,
+    input  wire                       add_done,
+    output reg  [WIDTH-1:0]           add_x1, add_y1, add_z1,
+    output reg  [WIDTH-1:0]           add_x2, add_y2, add_z2,
+    input  wire [WIDTH-1:0]           add_x3, add_y3, add_z3,
+
+    // Interfaz de Control con jacobian_point_double
+    output reg                        dbl_start,
+    input  wire                       dbl_done,
+    output reg  [WIDTH-1:0]           dbl_x1, dbl_y1, dbl_z1,
+    input  wire [WIDTH-1:0]           dbl_x3, dbl_y3, dbl_z3,
+
+    // Salida final Q(X, Y, Z) en coordenadas Jacobianas Montgomery
     output reg  [WIDTH-1:0]           x_out,
     output reg  [WIDTH-1:0]           y_out,
     output reg  [WIDTH-1:0]           z_out
 );
 
-    localparam ST_IDLE       = 3'b000;
-    localparam ST_SCAN_BIT   = 3'b001;
-    localparam ST_EXTRACT_W  = 3'b010;
-    localparam ST_READ_RAM   = 3'b011;
-    localparam ST_ACCUMULATE = 3'b100;
-    localparam ST_DONE       = 3'b101;
+    // Codificación de Estados
+    localparam ST_IDLE       = 3'd0;
+    localparam ST_SCAN       = 3'd1;
+    localparam ST_DBL        = 3'd2;
+    localparam ST_WAIT_DBL   = 3'd3;
+    localparam ST_READ_RAM   = 3'd4;
+    localparam ST_ADD        = 3'd5;
+    localparam ST_WAIT_ADD   = 3'd6;
+    localparam ST_DONE       = 3'd7;
 
     reg [2:0]       state;
     integer         bit_idx;
     reg [WIDTH-1:0] k_reg;
-    reg [2:0]       shift_cnt;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state     <= ST_IDLE;
-            done      <= 1'b0;
-            busy      <= 1'b0;
-            ram_raddr <= {(WINDOW_SIZE-1){1'b0}};
-            x_out     <= {WIDTH{1'b0}};
-            y_out     <= {WIDTH{1'b0}};
-            z_out     <= {WIDTH{1'b0}};
-            bit_idx   <= 255;
-            k_reg     <= {WIDTH{1'b0}};
-            shift_cnt <= 3'd0;
+            state      <= ST_IDLE;
+            done       <= 1'b0;
+            busy       <= 1'b0;
+            add_start  <= 1'b0;
+            dbl_start  <= 1'b0;
+            ram_raddr  <= {(WINDOW_SIZE-1){1'b0}};
+            x_out      <= {WIDTH{1'b0}};
+            y_out      <= {WIDTH{1'b0}};
+            z_out      <= {WIDTH{1'b0}};
+            add_x1     <= {WIDTH{1'b0}}; add_y1 <= {WIDTH{1'b0}}; add_z1 <= {WIDTH{1'b0}};
+            add_x2     <= {WIDTH{1'b0}}; add_y2 <= {WIDTH{1'b0}}; add_z2 <= {WIDTH{1'b0}};
+            dbl_x1     <= {WIDTH{1'b0}}; dbl_y1 <= {WIDTH{1'b0}}; dbl_z1 <= {WIDTH{1'b0}};
+            bit_idx    <= 255;
+            k_reg      <= {WIDTH{1'b0}};
         end else begin
             case (state)
 
                 ST_IDLE: begin
-                    done <= 1'b0;
+                    done      <= 1'b0;
+                    add_start <= 1'b0;
+                    dbl_start <= 1'b0;
                     if (start) begin
                         busy    <= 1'b1;
                         k_reg   <= k_scalar;
                         bit_idx <= 255;
-                        state   <= ST_SCAN_BIT;
+                        state   <= ST_SCAN;
                     end else begin
                         busy    <= 1'b0;
                     end
                 end
 
-                ST_SCAN_BIT: begin
+                // Explorar bits de k desde MSB a LSB
+                ST_SCAN: begin
                     if (bit_idx < 0) begin
                         state <= ST_DONE;
                     end else if (k_reg[bit_idx]) begin
-                        state <= ST_EXTRACT_W;
+                        // Iniciar consulta de punto en RAM
+                        ram_raddr <= k_reg[bit_idx -: (WINDOW_SIZE-1)];
+                        state     <= ST_READ_RAM;
                     end else begin
-                        bit_idx <= bit_idx - 1;
+                        // Ejecutar duplicación de punto
+                        dbl_x1    <= x_out;
+                        dbl_y1    <= y_out;
+                        dbl_z1    <= z_out;
+                        dbl_start <= 1'b1;
+                        state     <= ST_WAIT_DBL;
                     end
                 end
 
-                ST_EXTRACT_W: begin
-                    begin: extract_block
-                        reg [WIDTH-1:0]       shifted_k;
-                        reg [WINDOW_SIZE-1:0] raw_win;
-                        integer win_len;
-
-                        if (bit_idx >= WINDOW_SIZE - 1)
-                            shifted_k = k_reg >> (bit_idx - (WINDOW_SIZE - 1));
-                        else
-                            shifted_k = k_reg << (WINDOW_SIZE - 1 - bit_idx);
-
-                        raw_win = shifted_k[WINDOW_SIZE-1:0];
-
-                        win_len = WINDOW_SIZE;
-                        while (win_len > 1 && raw_win[0] == 1'b0) begin
-                            raw_win = raw_win >> 1;
-                            win_len = win_len - 1;
-                        end
-
-                        ram_raddr <= raw_win[WINDOW_SIZE-1:1];
-                        shift_cnt <= win_len[2:0];
-                        state     <= ST_READ_RAM;
+                ST_WAIT_DBL: begin
+                    dbl_start <= 1'b0;
+                    if (dbl_done) begin
+                        x_out   <= dbl_x3;
+                        y_out   <= dbl_y3;
+                        z_out   <= dbl_z3;
+                        bit_idx <= bit_idx - 1;
+                        state   <= ST_SCAN;
                     end
                 end
 
                 ST_READ_RAM: begin
-                    state <= ST_ACCUMULATE;
+                    state <= ST_ADD;
                 end
 
-                ST_ACCUMULATE: begin
-                    begin: accum_block
-                        reg [WIDTH:0] temp_y;
-                        temp_y = {1'b0, ram_dout} + 1'b1;
-                        x_out <= ram_dout;
-                        y_out <= temp_y[WIDTH-1:0];
-                        z_out <= 256'd1;
-                    end
+                ST_ADD: begin
+                    add_x1    <= x_out;
+                    add_y1    <= y_out;
+                    add_z1    <= z_out;
+                    add_x2    <= ram_dout_x;
+                    add_y2    <= ram_dout_y;
+                    add_z2    <= 256'd1; // Z=1 para puntos afines precomputados
+                    add_start <= 1'b1;
+                    state     <= ST_WAIT_ADD;
+                end
 
-                    if (bit_idx < shift_cnt) begin
-                        bit_idx <= -1;
-                        state   <= ST_DONE;
-                    end else begin
-                        bit_idx <= bit_idx - shift_cnt;
-                        state   <= ST_SCAN_BIT;
+                ST_WAIT_ADD: begin
+                    add_start <= 1'b0;
+                    if (add_done) begin
+                        x_out   <= add_x3;
+                        y_out   <= add_y3;
+                        z_out   <= add_z3;
+                        bit_idx <= bit_idx - WINDOW_SIZE;
+                        state   <= ST_SCAN;
                     end
                 end
 
