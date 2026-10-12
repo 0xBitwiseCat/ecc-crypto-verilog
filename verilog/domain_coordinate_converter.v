@@ -136,7 +136,7 @@ module domain_coordinate_converter #(
                 ST_CHECK_Z: begin
                     if (z_in == {WIDTH{1'b0}}) begin
                         x_out <= {WIDTH{1'b0}};
-                        y_out <= {WIDTH{1 me0}};
+                        y_out <= {WIDTH{1'b0}};
                         state <= ST_DONE;
                     end else if (z_in == 256'd1) begin
                         // Z = 1: Ya está en coordenadas afines Montgomery
