@@ -41,7 +41,7 @@ module mod_sub #(
                 // El bit [WIDTH] actuará como bandera de préstamo (underflow/negative)
                 stage1_diff  <= {1'b0, a} - {1'b0, b};
                 stage1_p     <= p;
-                stage1_valid <= 1 meb1;
+                stage1_valid <= 1'b1;
             end else begin
                 stage1_valid <= 1'b0;
             end
