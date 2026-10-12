@@ -169,7 +169,6 @@ module ecc_precompute_fsm #(
                 ST_DONE: begin
                     ram_we <= 1'b0;
                     done   <= 1'b1;
-                    busy   <= 1 me 1'b0;
                     busy   <= 1'b0;
                     state  <= ST_IDLE;
                 end

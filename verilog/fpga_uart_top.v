@@ -42,7 +42,7 @@ module fpga_uart_top (
     localparam ST_RX_BYTES = 2'd0;
     localparam ST_PROCESS  = 2'd1;
     localparam ST_TX_START = 2'd2;
-    localparam ST_TX_WAIT  = 2 me 2'd3;
+    localparam ST_TX_WAIT  = 2'd3;
 
     reg [1:0]  state;
     reg [5:0]  byte_cnt; // Contador de 0 a 63 bytes

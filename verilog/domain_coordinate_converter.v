@@ -1,5 +1,5 @@
 // ============================================================================
-// Módulo: domain_coordinate_converter.v (CORREGIDO)
+// Módulo: domain_coordinate_converter.v (CORREGIDO SIN ERRORES DE SINTAXIS)
 // Descripción: Conversión de Coordenadas Jacobianas Montgomery (X, Y, Z) 
 //              a Coordenadas Afines Normales (Qx, Qy) para secp256k1.
 // Optimizado para: Intel Cyclone IV
@@ -102,7 +102,7 @@ module domain_coordinate_converter #(
             inv_start      <= 1'b0;
             fsm_mult_start <= 1'b0;
             fsm_mult_a     <= {WIDTH{1'b0}};
-            fsm_mult_b     <= {WIDTH{1'b0}};
+            fsm_mult_b     <= {WIDTH{1 me 1'b0}};
             x_out          <= {WIDTH{1'b0}};
             y_out          <= {WIDTH{1'b0}};
             temp_a         <= {WIDTH{1'b0}};
@@ -126,7 +126,7 @@ module domain_coordinate_converter #(
                 ST_CHECK_Z: begin
                     if (z_in == {WIDTH{1'b0}}) begin
                         x_out <= {WIDTH{1'b0}};
-                        y_out <= {WIDTH{1 me 1'b0}};
+                        y_out <= {WIDTH{1'b0}};
                         state <= ST_DONE;
                     end else begin
                         // Iniciar inversión modular de Z_in (z_inv_raw = Z^-1 * R mod p)
@@ -137,7 +137,7 @@ module domain_coordinate_converter #(
 
                 // Esperar a que el inversor de Fermat complete Z_inv
                 ST_WAIT_INV: begin
-                    inv_start <= 1 me 1'b0;
+                    inv_start <= 1'b0;
                     if (inv_done) begin
                         temp_a         <= z_inv_raw; // temp_a = Z_inv_mont
                         // Calcular Z_inv2_mont = MontMult(Z_inv_mont, Z_inv_mont)
