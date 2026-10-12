@@ -15,6 +15,7 @@ module ecc_sliding_window_engine #(
     input  wire                       start,
     output reg                        done,
     output reg                        busy,
+    output wire                       op_type,
 
     // Datos
     input  wire [WIDTH-1:0]           k_scalar,
@@ -57,6 +58,9 @@ module ecc_sliding_window_engine #(
     reg [8:0]       bits_left; // Contador de 256 a 0 bits
     reg [WIDTH-1:0] k_reg;     // Registro de desplazamiento de 256 bits
     reg             is_first;  // Bandera para cargar primer punto directamente
+
+    // Indicar op_type = 1 (Double) durante el estado de doblamiento
+    assign op_type = (state == ST_WAIT_DBL) ? 1'b1 : 1'b0;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

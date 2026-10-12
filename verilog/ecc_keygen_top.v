@@ -140,89 +140,44 @@ module ecc_keygen_top #(
         .dout_y(ram_dout_y)
     );
 
-    // 2. Control FSM de Precomputación (Puntos Impares 1G a 63G)
+   // Instancia de Precomputación conectada con op_type explícito
     ecc_precompute_fsm #(
-        .WIDTH(WIDTH),
-        .WINDOW_SIZE(WINDOW_SIZE)
+        .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) precomp_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(precomp_start),
-        .done(precomp_done),
-        .busy(precomp_busy),
-        .gx_mont(GX_MONT),
-        .gy_mont(GY_MONT),
-        .p(SECP256K1_P),
-        .ram_we(ram_we),
-        .ram_waddr(ram_waddr),
-        .ram_din_x(ram_din_x),
-        .ram_din_y(ram_din_y),
-        .dbl_start(precomp_op_start),
-        .dbl_done(op_done && precomp_busy),
-        .dbl_x1(precomp_op_x1),
-        .dbl_y1(precomp_op_y1),
-        .dbl_z1(precomp_op_z1),
-        .dbl_x3(op_x3),
-        .dbl_y3(op_y3),
-        .dbl_z3(op_z3),
-        .add_start(precomp_op_start),
-        .add_done(op_done && precomp_busy),
-        .add_x1(precomp_op_x1),
-        .add_y1(precomp_op_y1),
-        .add_z1(precomp_op_z1),
-        .add_x2(precomp_op_x2),
-        .add_y2(precomp_op_y2),
-        .add_z2(precomp_op_z2),
-        .add_x3(op_x3),
-        .add_y3(op_y3),
-        .add_z3(op_z3)
+        .clk(clk), .rst_n(rst_n),
+        .start(precomp_start), .done(precomp_done), .busy(precomp_busy),
+        .op_type(precomp_op_type), // Conexión directa
+        .gx_mont(GX_MONT), .gy_mont(GY_MONT), .p(SECP256K1_P),
+        .ram_we(ram_we), .ram_waddr(ram_waddr),
+        .ram_din_x(ram_din_x), .ram_din_y(ram_din_y),
+        .dbl_start(precomp_op_start), .dbl_done(op_done && precomp_busy),
+        .dbl_x1(precomp_op_x1), .dbl_y1(precomp_op_y1), .dbl_z1(precomp_op_z1),
+        .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
+        .add_start(precomp_op_start), .add_done(op_done && precomp_busy),
+        .add_x1(precomp_op_x1), .add_y1(precomp_op_y1), .add_z1(precomp_op_z1),
+        .add_x2(precomp_op_x2), .add_y2(precomp_op_y2), .add_z2(precomp_op_z2),
+        .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3)
     );
 
-    // Asignar tipo de operación para precomputación
-    assign precomp_op_type = (precomp_inst.state == 3'd2) ? 1'b1 : 1'b0; // 1: Double, 0: Add
-
-    // 3. Motor de Ventana Deslizante (Multiplicación Escalar k*G)
+    // Instancia del Motor de Ventana conectada con op_type explícito
     ecc_sliding_window_engine #(
-        .WIDTH(WIDTH),
-        .WINDOW_SIZE(WINDOW_SIZE)
+        .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) sw_engine_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(sw_start),
-        .done(sw_done),
-        .busy(sw_busy),
-        .k_scalar(k_scalar),
-        .p(SECP256K1_P),
-        .ram_raddr(ram_raddr),
-        .ram_dout_x(ram_dout_x),
-        .ram_dout_y(ram_dout_y),
-        .add_start(sw_op_start),
-        .add_done(op_done && sw_busy),
-        .add_x1(sw_op_x1),
-        .add_y1(sw_op_y1),
-        .add_z1(sw_op_z1),
-        .add_x2(sw_op_x2),
-        .add_y2(sw_op_y2),
-        .add_z2(sw_op_z2),
-        .add_x3(op_x3),
-        .add_y3(op_y3),
-        .add_z3(op_z3),
-        .dbl_start(sw_op_start),
-        .dbl_done(op_done && sw_busy),
-        .dbl_x1(sw_op_x1),
-        .dbl_y1(sw_op_y1),
-        .dbl_z1(sw_op_z1),
-        .dbl_x3(op_x3),
-        .dbl_y3(op_y3),
-        .dbl_z3(op_z3),
-        .x_out(sw_x),
-        .y_out(sw_y),
-        .z_out(sw_z)
+        .clk(clk), .rst_n(rst_n),
+        .start(sw_start), .done(sw_done), .busy(sw_busy),
+        .op_type(sw_op_type), // Conexión directa
+        .k_scalar(k_scalar), .p(SECP256K1_P),
+        .ram_raddr(ram_raddr), .ram_dout_x(ram_dout_x), .ram_dout_y(ram_dout_y),
+        .add_start(sw_op_start), .add_done(op_done && sw_busy),
+        .add_x1(sw_op_x1), .add_y1(sw_op_y1), .add_z1(sw_op_z1),
+        .add_x2(sw_op_x2), .add_y2(sw_op_y2), .add_z2(sw_op_z2),
+        .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3),
+        .dbl_start(sw_op_start), .dbl_done(op_done && sw_busy),
+        .dbl_x1(sw_op_x1), .dbl_y1(sw_op_y1), .dbl_z1(sw_op_z1),
+        .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
+        .x_out(sw_x), .y_out(sw_y), .z_out(sw_z)
     );
-
-    // Asignar tipo de operación para el motor de ventana
-    assign sw_op_type = (sw_engine_inst.state == 3'd2) ? 1'b1 : 1'b0; // 1: Double, 0: Add
-
+    
     // 4. Operador Geométrico Jacobiano Unificado
     jacobian_point_op #(
         .WIDTH(WIDTH)

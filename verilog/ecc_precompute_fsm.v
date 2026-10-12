@@ -15,6 +15,7 @@ module ecc_precompute_fsm #(
     input  wire                       start,
     output reg                        done,
     output reg                        busy,
+    output wire                       op_type,
 
     // Entradas: Coordenadas de G en Dominio Montgomery y Módulo P
     input  wire [WIDTH-1:0]           gx_mont,
@@ -59,6 +60,9 @@ module ecc_precompute_fsm #(
     reg [WIDTH-1:0] g2_x, g2_y, g2_z;
     // Registros del último punto impar (P_prev)
     reg [WIDTH-1:0] prev_x, prev_y, prev_z;
+
+    // Indicar op_type = 1 (Double) durante el estado de doblamiento
+    assign op_type = (state == ST_WAIT_DBL) ? 1'b1 : 1'b0;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
