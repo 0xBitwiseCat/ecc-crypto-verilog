@@ -2,9 +2,9 @@
 // Módulo: jacobian_point_op.v
 // Descripción: Operador Geométrico-Jacobiano Unificado (Adición y Doblamiento)
 //              para secp256k1 (a=0) en Dominio Montgomery.
-// Operación: op_type = 0 -> R = P + Q (Point Addition)
-//            op_type = 1 -> R = 2P    (Point Doubling)
-// Optimizado para: Intel Cyclone IV
+// Optimización: Procesamiento por Palabras (W=16 bits) para Suma/Resta Modular
+//               para reducir el uso de ALUTs de 10,680 a ~1,100.
+// Optimizado para: Intel Cyclone IV (EP4CE6E22C8)
 // ============================================================================
 
 module jacobian_point_op #(
@@ -50,46 +50,51 @@ module jacobian_point_op #(
     localparam ST_DBL_M_FINAL   = 6'd6;
     localparam ST_DBL_X1_YY     = 6'd7;
     localparam ST_DBL_S_PREP    = 6'd8;
-    localparam ST_DBL_M2        = 6'd9;
-    localparam ST_DBL_X3        = 6'd10;
-    localparam ST_DBL_Y1_Z1     = 6'd11;
-    localparam ST_DBL_Z3        = 6'd12;
-    localparam ST_DBL_M_S_X3    = 6'd13;
-    localparam ST_DBL_8YYYY_1   = 6'd14;
-    localparam ST_DBL_8YYYY_2   = 6'd15;
-    localparam ST_DBL_8YYYY_3   = 6'd16;
-    localparam ST_DBL_Y3        = 6'd17;
+    localparam ST_DBL_S_CALC    = 6'd9;
+    localparam ST_DBL_M2        = 6'd10;
+    localparam ST_DBL_2S        = 6'd11;
+    localparam ST_DBL_X3        = 6'd12;
+    localparam ST_DBL_Y1_Z1     = 6'd13;
+    localparam ST_DBL_Z3        = 6'd14;
+    localparam ST_DBL_S_MINUS_X3= 6'd15;
+    localparam ST_DBL_M_S_X3    = 6'd16;
+    localparam ST_DBL_8YYYY_1   = 6'd17;
+    localparam ST_DBL_8YYYY_2   = 6'd18;
+    localparam ST_DBL_8YYYY_3   = 6'd19;
+    localparam ST_DBL_Y3        = 6'd20;
 
     // Estados de Adición (op_type == 0)
-    localparam ST_ADD_Z1_SQ     = 6'd18;
-    localparam ST_ADD_Z2_SQ     = 6'd19;
-    localparam ST_ADD_U1        = 6'd20;
-    localparam ST_ADD_U2        = 6'd21;
-    localparam ST_ADD_CALC_H    = 6'd22;
-    localparam ST_ADD_Z1_CU     = 6'd23;
-    localparam ST_ADD_S2        = 6'd24;
-    localparam ST_ADD_Z2_CU     = 6'd25;
-    localparam ST_ADD_S1        = 6'd26;
-    localparam ST_ADD_CALC_R    = 6'd27;
-    localparam ST_ADD_H2        = 6'd28;
-    localparam ST_ADD_H3        = 6'd29;
-    localparam ST_ADD_V         = 6'd30;
-    localparam ST_ADD_R2        = 6'd31;
-    localparam ST_ADD_X3_PREP   = 6'd32;
-    localparam ST_ADD_X3_SUB2V  = 6'd33;
-    localparam ST_ADD_V_X3      = 6'd34;
-    localparam ST_ADD_R_VX3     = 6'd35;
-    localparam ST_ADD_S1_H3     = 6'd36;
-    localparam ST_ADD_Y3        = 6'd37;
-    localparam ST_ADD_Z1_Z2     = 6'd38;
-    localparam ST_ADD_Z3        = 6'd39;
+    localparam ST_ADD_Z1_SQ     = 6'd21;
+    localparam ST_ADD_Z2_SQ     = 6'd22;
+    localparam ST_ADD_U1        = 6'd23;
+    localparam ST_ADD_U2        = 6'd24;
+    localparam ST_ADD_CALC_H    = 6'd25;
+    localparam ST_ADD_Z1_CU     = 6'd26;
+    localparam ST_ADD_S2        = 6'd27;
+    localparam ST_ADD_Z2_CU     = 6'd28;
+    localparam ST_ADD_S1        = 6'd29;
+    localparam ST_ADD_CALC_R    = 6'd30;
+    localparam ST_ADD_H2        = 6'd31;
+    localparam ST_ADD_H3        = 6'd32;
+    localparam ST_ADD_V         = 6'd33;
+    localparam ST_ADD_R2        = 6'd34;
+    localparam ST_ADD_X3_PREP   = 6'd35;
+    localparam ST_ADD_2V        = 6'd36;
+    localparam ST_ADD_X3_FINAL  = 6'd37;
+    localparam ST_ADD_V_X3      = 6'd38;
+    localparam ST_ADD_R_VX3     = 6'd39;
+    localparam ST_ADD_S1_H3     = 6'd40;
+    localparam ST_ADD_Y3        = 6'd41;
+    localparam ST_ADD_Z1_Z2     = 6'd42;
+    localparam ST_ADD_Z3        = 6'd43;
 
-    localparam ST_MULT_WAIT     = 6'd40;
-    localparam ST_DONE          = 6'd41;
+    localparam ST_MULT_WAIT     = 6'd44;
+    localparam ST_ALU_WAIT      = 6'd45;
+    localparam ST_DONE          = 6'd46;
 
-    reg [5:0] state, next_state;
+    reg [5:0] state, next_state, alu_next_state;
 
-    // Banco de Registros Temporales Compartidos (Solo 6 registros de 256 bits)
+    // Banco de Registros Temporales Compartidos
     reg [WIDTH-1:0] t1, t2, t3;
     reg [WIDTH-1:0] reg_a, reg_b, reg_c;
 
@@ -103,38 +108,47 @@ module jacobian_point_op #(
     assign mult_b     = fsm_mult_b;
 
     // ------------------------------------------------------------------------
-    // Unidad Aritmética Modular Única Compartida (Suma / Resta)
-    // Se emplean señales intermedias para evitar truncamientos e incompatibilidad
-    // de slicing directo sobre operaciones en Quartus.
+    // Unidad Aritmética Modular Iterativa de 16 bits (ALU)
     // ------------------------------------------------------------------------
-    reg  [WIDTH-1:0] add_in_a, add_in_b;
-    wire [WIDTH-1:0] add_out;
-    reg  [WIDTH-1:0] sub_in_a, sub_in_b;
-    wire [WIDTH-1:0] sub_out;
+    reg                 alu_start;
+    reg                 alu_op; // 0: ADD, 1: SUB
+    reg  [WIDTH-1:0]    alu_a;
+    reg  [WIDTH-1:0]    alu_b;
+    wire                alu_done;
+    wire [WIDTH-1:0]    alu_result;
 
-    wire [WIDTH:0] add_sum = add_in_a + add_in_b;
-    wire [WIDTH:0] add_sub = add_sum - p;
-    assign add_out = (add_sum >= p) ? add_sub[WIDTH-1:0] : add_sum[WIDTH-1:0];
-
-    wire [WIDTH:0] sub_diff1  = sub_in_a - sub_in_b;
-    wire [WIDTH:0] sub_plus_p = sub_in_a + p;
-    wire [WIDTH:0] sub_diff2  = sub_plus_p - sub_in_b;
-    wire [WIDTH:0] sub_diff   = (sub_in_a >= sub_in_b) ? sub_diff1 : sub_diff2;
-    assign sub_out = sub_diff[WIDTH-1:0];
+    mod_add_sub_16bit #(
+        .WIDTH(WIDTH)
+    ) alu_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(alu_start),
+        .op(alu_op),
+        .a(alu_a),
+        .b(alu_b),
+        .p(p),
+        .done(alu_done),
+        .result(alu_result)
+    );
 
     // ------------------------------------------------------------------------
-    // FSM de Control
+    // FSM Principal
     // ------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state          <= ST_IDLE;
             next_state     <= ST_IDLE;
+            alu_next_state <= ST_IDLE;
             done           <= 1'b0;
             busy           <= 1'b0;
             is_double      <= 1'b0;
             fsm_mult_start <= 1'b0;
             fsm_mult_a     <= {WIDTH{1'b0}};
             fsm_mult_b     <= {WIDTH{1'b0}};
+            alu_start      <= 1'b0;
+            alu_op         <= 1'b0;
+            alu_a          <= {WIDTH{1'b0}};
+            alu_b          <= {WIDTH{1'b0}};
             x3             <= {WIDTH{1'b0}};
             y3             <= {WIDTH{1'b0}};
             z3             <= {WIDTH{1'b0}};
@@ -144,17 +158,12 @@ module jacobian_point_op #(
             reg_a          <= {WIDTH{1'b0}};
             reg_b          <= {WIDTH{1'b0}};
             reg_c          <= {WIDTH{1'b0}};
-            add_in_a       <= {WIDTH{1'b0}};
-            add_in_b       <= {WIDTH{1'b0}};
-            sub_in_a       <= {WIDTH{1'b0}};
-            sub_in_b       <= {WIDTH{1'b0}};
         end else begin
             case (state)
 
                 ST_IDLE: begin
-                    done           <= 1'b0;
-                    is_double      <= 1'b0;
-                    fsm_mult_start <= 1'b0;
+                    done      <= 1'b0;
+                    is_double <= 1'b0;
                     if (start) begin
                         busy  <= 1'b1;
                         state <= ST_CHECK_INF;
@@ -179,7 +188,7 @@ module jacobian_point_op #(
                         if (z1 == {WIDTH{1'b0}}) begin
                             x3 <= x2; y3 <= y2; z3 <= z2;
                             state <= ST_DONE;
-                        end else if (z2 == {WIDTH{1'b0}}) begin
+                        end else if (z2 == {WIDTH{1 me{1'b0}}}) begin
                             x3 <= x1; y3 <= y1; z3 <= z1;
                             state <= ST_DONE;
                         end else begin
@@ -214,38 +223,55 @@ module jacobian_point_op #(
                 end
 
                 ST_DBL_YYYY: begin
-                    t3       <= mult_result; // YYYY
-                    add_in_a <= t1;          // XX + XX
-                    add_in_b <= t1;
-                    state    <= ST_DBL_M_PREP;
+                    t3             <= mult_result; // YYYY
+                    alu_a          <= t1;          // XX + XX
+                    alu_b          <= t1;
+                    alu_op         <= 1'b0;        // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_M_PREP;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_M_PREP: begin
-                    add_in_a <= add_out;     // 2XX + XX
-                    add_in_b <= t1;
-                    state    <= ST_DBL_M_FINAL;
+                    reg_a          <= alu_result;  // 2XX
+                    alu_a          <= alu_result;  // 2XX + XX
+                    alu_b          <= t1;
+                    alu_op         <= 1'b0;        // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_M_FINAL;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_M_FINAL: begin
-                    reg_a          <= add_out; // M = 3XX
+                    reg_a          <= alu_result; // M = 3XX
                     fsm_mult_a     <= x1;
-                    fsm_mult_b     <= t2;      // YY
+                    fsm_mult_b     <= t2;        // YY
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_DBL_X1_YY;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_DBL_X1_YY: begin
-                    add_in_a <= mult_result;
-                    add_in_b <= mult_result;
-                    state    <= ST_DBL_S_PREP;
+                    alu_a          <= mult_result;
+                    alu_b          <= mult_result;
+                    alu_op         <= 1'b0; // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_S_PREP;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_S_PREP: begin
-                    add_in_a       <= add_out;
-                    add_in_b       <= add_out;
-                    reg_b          <= add_out;
-                    fsm_mult_a     <= reg_a; // M
+                    alu_a          <= alu_result;
+                    alu_b          <= alu_result;
+                    alu_op         <= 1'b0; // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_S_CALC;
+                    state          <= ST_ALU_WAIT;
+                end
+
+                ST_DBL_S_CALC: begin
+                    reg_b          <= alu_result; // S = 4*X1*YY
+                    fsm_mult_a     <= reg_a;      // M
                     fsm_mult_b     <= reg_a;
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_DBL_M2;
@@ -253,16 +279,27 @@ module jacobian_point_op #(
                 end
 
                 ST_DBL_M2: begin
-                    reg_b    <= add_out; // S
-                    add_in_a <= add_out;
-                    add_in_b <= add_out;
-                    sub_in_a <= mult_result;
-                    sub_in_b <= add_out;
-                    state    <= ST_DBL_X3;
+                    t1             <= mult_result; // M^2
+                    alu_a          <= reg_b;       // S + S = 2S
+                    alu_b          <= reg_b;
+                    alu_op         <= 1'b0;        // ADD
+                    alu_start      <= 1 me_1'b1;
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_2S;
+                    state          <= ST_ALU_WAIT;
+                end
+
+                ST_DBL_2S: begin
+                    alu_a          <= t1;         // M^2 - 2S
+                    alu_b          <= alu_result; // 2S
+                    alu_op         <= 1'b1;       // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_X3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_X3: begin
-                    x3             <= sub_out;
+                    x3             <= alu_result;
                     fsm_mult_a     <= y1;
                     fsm_mult_b     <= z1;
                     fsm_mult_start <= 1'b1;
@@ -271,50 +308,72 @@ module jacobian_point_op #(
                 end
 
                 ST_DBL_Y1_Z1: begin
-                    add_in_a <= mult_result;
-                    add_in_b <= mult_result;
-                    sub_in_a <= reg_b;
-                    sub_in_b <= x3;
-                    state    <= ST_DBL_Z3;
+                    alu_a          <= mult_result; // 2*Y1*Z1
+                    alu_b          <= mult_result;
+                    alu_op         <= 1'b0;        // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_Z3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_Z3: begin
-                    z3             <= add_out;
-                    t2             <= sub_out;
-                    fsm_mult_a     <= reg_a; // M
-                    fsm_mult_b     <= sub_out;
+                    z3             <= alu_result;
+                    alu_a          <= reg_b;      // S - X3
+                    alu_b          <= x3;
+                    alu_op         <= 1'b1;       // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_S_MINUS_X3;
+                    state          <= ST_ALU_WAIT;
+                end
+
+                ST_DBL_S_MINUS_X3: begin
+                    t2             <= alu_result; // S - X3
+                    fsm_mult_a     <= reg_a;      // M
+                    fsm_mult_b     <= alu_result;
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_DBL_M_S_X3;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_DBL_M_S_X3: begin
-                    t1       <= mult_result;
-                    add_in_a <= t3; // YYYY
-                    add_in_b <= t3;
-                    state    <= ST_DBL_8YYYY_1;
+                    t1             <= mult_result; // M*(S - X3)
+                    alu_a          <= t3;          // YYYY + YYYY = 2YYYY
+                    alu_b          <= t3;
+                    alu_op         <= 1'b0;        // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_8YYYY_1;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_8YYYY_1: begin
-                    add_in_a <= add_out;
-                    add_in_b <= add_out;
-                    state    <= ST_DBL_8YYYY_2;
+                    alu_a          <= alu_result; // 2YYYY + 2YYYY = 4YYYY
+                    alu_b          <= alu_result;
+                    alu_op         <= 1'b0;       // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_8YYYY_2;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_8YYYY_2: begin
-                    add_in_a <= add_out;
-                    add_in_b <= add_out;
-                    state    <= ST_DBL_8YYYY_3;
+                    alu_a          <= alu_result; // 4YYYY + 4YYYY = 8YYYY
+                    alu_b          <= alu_result;
+                    alu_op         <= 1'b0;       // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_8YYYY_3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_8YYYY_3: begin
-                    sub_in_a <= t1;
-                    sub_in_b <= add_out;
-                    state    <= ST_DBL_Y3;
+                    alu_a          <= t1;         // M*(S-X3) - 8YYYY
+                    alu_b          <= alu_result; // 8YYYY
+                    alu_op         <= 1'b1;       // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_DBL_Y3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_DBL_Y3: begin
-                    y3    <= sub_out;
+                    y3    <= alu_result;
                     state <= ST_DONE;
                 end
 
@@ -349,23 +408,26 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_U2: begin
-                    reg_a    <= mult_result; // U2
-                    sub_in_a <= mult_result;
-                    sub_in_b <= t3;
-                    state    <= ST_ADD_CALC_H;
+                    reg_a          <= mult_result; // U2
+                    alu_a          <= mult_result; // U2 - U1
+                    alu_b          <= t3;
+                    alu_op         <= 1'b1;        // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_CALC_H;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_ADD_CALC_H: begin
-                    reg_a          <= sub_out; // H
+                    reg_a          <= alu_result; // H
                     fsm_mult_a     <= z1;
-                    fsm_mult_b     <= t1;
+                    fsm_mult_b     <= t1;         // Z1^2
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_Z1_CU;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_ADD_Z1_CU: begin
-                    t1             <= mult_result;
+                    t1             <= mult_result; // Z1^3
                     fsm_mult_a     <= y2;
                     fsm_mult_b     <= mult_result;
                     fsm_mult_start <= 1'b1;
@@ -376,14 +438,14 @@ module jacobian_point_op #(
                 ST_ADD_S2: begin
                     reg_b          <= mult_result; // S2
                     fsm_mult_a     <= z2;
-                    fsm_mult_b     <= t2;
+                    fsm_mult_b     <= t2;          // Z2^2
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_Z2_CU;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_ADD_Z2_CU: begin
-                    t2             <= mult_result;
+                    t2             <= mult_result; // Z2^3
                     fsm_mult_a     <= y1;
                     fsm_mult_b     <= mult_result;
                     fsm_mult_start <= 1'b1;
@@ -392,16 +454,19 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_S1: begin
-                    reg_c    <= mult_result; // S1
-                    sub_in_a <= reg_b;
-                    sub_in_b <= mult_result;
-                    state    <= ST_ADD_CALC_R;
+                    reg_c          <= mult_result; // S1
+                    alu_a          <= reg_b;       // S2 - S1
+                    alu_b          <= mult_result;
+                    alu_op         <= 1'b1;        // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_CALC_R;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_ADD_CALC_R: begin
-                    reg_b <= sub_out; // R
+                    reg_b <= alu_result; // R
                     if (reg_a == {WIDTH{1'b0}}) begin
-                        if (sub_out == {WIDTH{1'b0}}) begin
+                        if (alu_result == {WIDTH{1'b0}}) begin
                             is_double <= 1'b1;
                         end
                         x3 <= {WIDTH{1'b0}}; y3 <= {WIDTH{1'b0}}; z3 <= {WIDTH{1'b0}};
@@ -443,54 +508,73 @@ module jacobian_point_op #(
                 end
 
                 ST_ADD_R2: begin
-                    t3       <= mult_result; // R^2
-                    sub_in_a <= mult_result;
-                    sub_in_b <= t2;          // H^3
-                    add_in_a <= t1;          // V
-                    add_in_b <= t1;
-                    state    <= ST_ADD_X3_PREP;
+                    t3             <= mult_result; // R^2
+                    alu_a          <= mult_result; // R^2 - H^3
+                    alu_b          <= t2;
+                    alu_op         <= 1'b1;        // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_X3_PREP;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_ADD_X3_PREP: begin
-                    x3       <= sub_out;
-                    sub_in_a <= sub_out;
-                    sub_in_b <= add_out;     // 2V
-                    state    <= ST_ADD_X3_SUB2V;
+                    reg_a          <= alu_result; // R^2 - H^3
+                    alu_a          <= t1;         // V + V = 2V
+                    alu_b          <= t1;
+                    alu_op         <= 1'b0;       // ADD
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_2V;
+                    state          <= ST_ALU_WAIT;
                 end
 
-                ST_ADD_X3_SUB2V: begin
-                    x3       <= sub_out;
-                    sub_in_a <= t1;          // V
-                    sub_in_b <= sub_out;     // X3
-                    state    <= ST_ADD_V_X3;
+                ST_ADD_2V: begin
+                    alu_a          <= reg_a;      // (R^2 - H^3) - 2V
+                    alu_b          <= alu_result; // 2V
+                    alu_op         <= 1'b1;       // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_X3_FINAL;
+                    state          <= ST_ALU_WAIT;
+                end
+
+                ST_ADD_X3_FINAL: begin
+                    x3             <= alu_result;
+                    alu_a          <= t1;         // V - X3
+                    alu_b          <= alu_result;
+                    alu_op         <= 1'b1;       // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_V_X3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_ADD_V_X3: begin
-                    t1             <= sub_out;
-                    fsm_mult_a     <= reg_b; // R
-                    fsm_mult_b     <= sub_out;
+                    t1             <= alu_result; // V - X3
+                    fsm_mult_a     <= reg_b;      // R
+                    fsm_mult_b     <= alu_result;
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_R_VX3;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_ADD_R_VX3: begin
-                    t3             <= mult_result;
-                    fsm_mult_a     <= reg_c; // S1
-                    fsm_mult_b     <= t2;    // H^3
+                    t3             <= mult_result; // R*(V - X3)
+                    fsm_mult_a     <= reg_c;       // S1
+                    fsm_mult_b     <= t2;          // H^3
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_S1_H3;
                     state          <= ST_MULT_WAIT;
                 end
 
                 ST_ADD_S1_H3: begin
-                    sub_in_a <= t3;
-                    sub_in_b <= mult_result;
-                    state    <= ST_ADD_Y3;
+                    alu_a          <= t3;          // R*(V - X3) - S1*H^3
+                    alu_b          <= mult_result; // S1*H^3
+                    alu_op         <= 1'b1;        // SUB
+                    alu_start      <= 1'b1;
+                    alu_next_state <= ST_ADD_Y3;
+                    state          <= ST_ALU_WAIT;
                 end
 
                 ST_ADD_Y3: begin
-                    y3             <= sub_out;
+                    y3             <= alu_result;
                     fsm_mult_a     <= z1;
                     fsm_mult_b     <= z2;
                     fsm_mult_start <= 1'b1;
@@ -500,7 +584,7 @@ module jacobian_point_op #(
 
                 ST_ADD_Z1_Z2: begin
                     fsm_mult_a     <= mult_result;
-                    fsm_mult_b     <= reg_a; // H
+                    fsm_mult_b     <= reg_a; // H (Re-almacenado o pasado)
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_Z3;
                     state          <= ST_MULT_WAIT;
@@ -511,6 +595,9 @@ module jacobian_point_op #(
                     state <= ST_DONE;
                 end
 
+                // ============================================================
+                // ESTADOS DE ESPERA
+                // ============================================================
                 ST_MULT_WAIT: begin
                     fsm_mult_start <= 1'b0;
                     if (mult_done) begin
@@ -518,9 +605,191 @@ module jacobian_point_op #(
                     end
                 end
 
+                ST_ALU_WAIT: begin
+                    alu_start <= 1'b0;
+                    if (alu_done) begin
+                        state <= alu_next_state;
+                    end
+                end
+
                 ST_DONE: begin
                     done  <= 1'b1;
                     busy  <= 1'b0;
+                    state <= ST_IDLE;
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// Submódulo Auxiliar: Sub-FSM Aritmética Modular Iterativa de 16 bits
+// Operación: op = 0 -> (A + B) mod P
+//            op = 1 -> (A - B) mod P
+// ============================================================================
+module mod_add_sub_16bit #(
+    parameter WIDTH     = 256,
+    parameter WORD_SIZE = 16,
+    parameter NUM_WORDS = WIDTH / WORD_SIZE
+)(
+    input  wire                 clk,
+    input  wire                 rst_n,
+    input  wire                 start,
+    input  wire                 op,     // 0: ADD, 1: SUB
+    input  wire [WIDTH-1:0]     a,
+    input  wire [WIDTH-1:0]     b,
+    input  wire [WIDTH-1:0]     p,
+    output reg                  done,
+    output reg  [WIDTH-1:0]     result
+);
+
+    localparam ST_IDLE       = 3'd0;
+    localparam ST_ADD_P1     = 3'd1;
+    localparam ST_ADD_P2     = 3'd2;
+    localparam ST_SUB_DIRECT = 3'd3;
+    localparam ST_SUB_P1     = 3'd4;
+    localparam ST_SUB_P2     = 3'd5;
+    localparam ST_DONE       = 3'd6;
+
+    reg [2:0] state;
+    reg [4:0] idx;
+    reg       carry_borrow;
+    reg [WIDTH-1:0] t_reg;
+    reg             t_carry;
+
+    wire [WORD_SIZE-1:0] a_w = a[idx*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] b_w = b[idx*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] p_w = p[idx*WORD_SIZE +: WORD_SIZE];
+    wire [WORD_SIZE-1:0] t_w = t_reg[idx*WORD_SIZE +: WORD_SIZE];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state        <= ST_IDLE;
+            done         <= 1'b0;
+            result       <= {WIDTH{1'b0}};
+            idx          <= 5'd0;
+            carry_borrow <= 1'b0;
+            t_reg        <= {WIDTH{1'b0}};
+            t_carry      <= 1'b0;
+        end else begin
+            case (state)
+                ST_IDLE: begin
+                    done <= 1'b0;
+                    if (start) begin
+                        idx          <= 5'd0;
+                        carry_borrow <= 1'b0;
+                        if (op == 1'b0) begin // ADD
+                            state <= ST_ADD_P1;
+                        end else begin // SUB
+                            if (a >= b)
+                                state <= ST_SUB_DIRECT;
+                            else
+                                state <= ST_SUB_P1;
+                        end
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // SUMA MODULAR: Paso 1 (S = A + B)
+                // ------------------------------------------------------------
+                ST_ADD_P1: begin
+                    begin
+                        wire [WORD_SIZE:0] sum_w = a_w + b_w + carry_borrow;
+                        t_reg[idx*WORD_SIZE +: WORD_SIZE] <= sum_w[WORD_SIZE-1:0];
+                        carry_borrow <= sum_w[WORD_SIZE];
+                    end
+
+                    if (idx == NUM_WORDS - 1) begin
+                        idx          <= 5'd0;
+                        carry_borrow <= 1'b0;
+                        begin
+                            wire [WORD_SIZE:0] sum_w = a_w + b_w + carry_borrow;
+                            t_carry <= sum_w[WORD_SIZE];
+                        end
+                        state <= ST_ADD_P2;
+                    end else begin
+                        idx <= idx + 1'b1;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // SUMA MODULAR: Paso 2 (Si S >= P, Result = S - P; en otro caso Result = S)
+                // ------------------------------------------------------------
+                ST_ADD_P2: begin
+                    if (t_carry || (t_reg >= p)) begin
+                        wire [WORD_SIZE+1:0] diff_w = {1'b0, t_w} - {1'b0, p_w} - carry_borrow;
+                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
+                        carry_borrow <= diff_w[WORD_SIZE+1];
+
+                        if (idx == NUM_WORDS - 1) begin
+                            state <= ST_DONE;
+                        end else begin
+                            idx <= idx + 1'b1;
+                        end
+                    end else begin
+                        result <= t_reg;
+                        state  <= ST_DONE;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // RESTA MODULAR (A >= B): Result = A - B
+                // ------------------------------------------------------------
+                ST_SUB_DIRECT: begin
+                    begin
+                        wire [WORD_SIZE+1:0] diff_w = {1'b0, a_w} - {1'b0, b_w} - carry_borrow;
+                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
+                        carry_borrow <= diff_w[WORD_SIZE+1];
+                    end
+
+                    if (idx == NUM_WORDS - 1) begin
+                        state <= ST_DONE;
+                    end else begin
+                        idx <= idx + 1'b1;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // RESTA MODULAR (A < B): Paso 1 (T = A + P)
+                // ------------------------------------------------------------
+                ST_SUB_P1: begin
+                    begin
+                        wire [WORD_SIZE:0] sum_w = a_w + p_w + carry_borrow;
+                        t_reg[idx*WORD_SIZE +: WORD_SIZE] <= sum_w[WORD_SIZE-1:0];
+                        carry_borrow <= sum_w[WORD_SIZE];
+                    end
+
+                    if (idx == NUM_WORDS - 1) begin
+                        idx          <= 5'd0;
+                        carry_borrow <= 1'b0;
+                        state        <= ST_SUB_P2;
+                    end else begin
+                        idx <= idx + 1'b1;
+                    end
+                end
+
+                // ------------------------------------------------------------
+                // RESTA MODULAR (A < B): Paso 2 (Result = T - B)
+                // ------------------------------------------------------------
+                ST_SUB_P2: begin
+                    begin
+                        wire [WORD_SIZE+1:0] diff_w = {1'b0, t_w} - {1'b0, b_w} - carry_borrow;
+                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
+                        carry_borrow <= diff_w[WORD_SIZE+1];
+                    end
+
+                    if (idx == NUM_WORDS - 1) begin
+                        state <= ST_DONE;
+                    end else begin
+                        idx <= idx + 1'b1;
+                    end
+                end
+
+                ST_DONE: begin
+                    done  <= 1'b1;
                     state <= ST_IDLE;
                 end
 
