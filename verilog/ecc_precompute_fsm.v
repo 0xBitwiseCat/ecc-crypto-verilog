@@ -1,6 +1,6 @@
 // ============================================================================
 // Módulo: ecc_precompute_fsm.v
-// Generación de 32 puntos impares (1G, 3G, 5G, ..., 63G) para w = 6
+// Descripción: Generación y almacenamiento en RAM de 32 puntos impares (w = 6)
 // ============================================================================
 
 module ecc_precompute_fsm #(
@@ -20,14 +20,13 @@ module ecc_precompute_fsm #(
     input  wire [WIDTH-1:0]           gy_mont,
     input  wire [WIDTH-1:0]           p,
 
-    // Interfaz de Escritura con ecc_point_ram (32 direcciones = 5 bits)
+    // Interfaz de Escritura con ecc_point_ram
     output reg                        ram_we,
     output reg  [WINDOW_SIZE-2:0]     ram_waddr,
     output reg  [WIDTH-1:0]           ram_din
 );
 
-    // Cantidad de puntos impares precomputados = 2^(w-1) = 32
-    localparam NUM_POINTS = 1 << (WINDOW_SIZE - 1);
+    localparam NUM_POINTS = 1 << (WINDOW_SIZE - 1); // 32
 
     localparam ST_IDLE       = 2'b00;
     localparam ST_WRITE_1G   = 2'b01;
@@ -35,7 +34,7 @@ module ecc_precompute_fsm #(
     localparam ST_DONE       = 2'b11;
 
     reg [1:0]             state;
-    reg [WINDOW_SIZE-2:0] point_cnt; // Contador de 0 a 31
+    reg [WINDOW_SIZE-1:0] point_cnt; // 6 bits (permite contar de 0 a 32)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -45,7 +44,7 @@ module ecc_precompute_fsm #(
             ram_we      <= 1'b0;
             ram_waddr   <= {(WINDOW_SIZE-1){1'b0}};
             ram_din     <= {WIDTH{1'b0}};
-            point_cnt   <= {(WINDOW_SIZE-1){1'b0}};
+            point_cnt   <= {WINDOW_SIZE{1'b0}};
         end else begin
             case (state)
 
@@ -54,14 +53,14 @@ module ecc_precompute_fsm #(
                     ram_we <= 1'b0;
                     if (start) begin
                         busy      <= 1'b1;
-                        point_cnt <= {(WINDOW_SIZE-1){1'b0}};
+                        point_cnt <= {WINDOW_SIZE{1'b0}};
                         state     <= ST_WRITE_1G;
                     end else begin
                         busy      <= 1'b0;
                     end
                 end
 
-                // Guardar 1G en la posición 0
+                // Guardar 1G en la posición 0 de la RAM
                 ST_WRITE_1G: begin
                     ram_we    <= 1'b1;
                     ram_waddr <= {(WINDOW_SIZE-1){1'b0}};
@@ -74,7 +73,7 @@ module ecc_precompute_fsm #(
                 ST_WRITE_LOOP: begin
                     if (point_cnt < NUM_POINTS) begin
                         ram_we    <= 1'b1;
-                        ram_waddr <= point_cnt;
+                        ram_waddr <= point_cnt[WINDOW_SIZE-2:0];
                         ram_din   <= gx_mont + point_cnt;
                         point_cnt <= point_cnt + 1'b1;
                     end else begin
