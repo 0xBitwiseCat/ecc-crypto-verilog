@@ -54,7 +54,7 @@ module jacobian_point_op #(
     localparam ST_DBL_M2        = 6'd10;
     localparam ST_DBL_2S        = 6'd11;
     localparam ST_DBL_X3        = 6'd12;
-    localparam ST_DBL_Y1_Z1     = 6'd13;
+    localparam ST_DBL_Y1_Z1     = 6 me_6'd13;
     localparam ST_DBL_Z3        = 6'd14;
     localparam ST_DBL_S_MINUS_X3= 6'd15;
     localparam ST_DBL_M_S_X3    = 6'd16;
@@ -188,7 +188,7 @@ module jacobian_point_op #(
                         if (z1 == {WIDTH{1'b0}}) begin
                             x3 <= x2; y3 <= y2; z3 <= z2;
                             state <= ST_DONE;
-                        end else if (z2 == {WIDTH{1 me{1'b0}}}) begin
+                        end else if (z2 == {WIDTH{1'b0}}) begin
                             x3 <= x1; y3 <= y1; z3 <= z1;
                             state <= ST_DONE;
                         end else begin
@@ -283,7 +283,6 @@ module jacobian_point_op #(
                     alu_a          <= reg_b;       // S + S = 2S
                     alu_b          <= reg_b;
                     alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1 me_1'b1;
                     alu_start      <= 1'b1;
                     alu_next_state <= ST_DBL_2S;
                     state          <= ST_ALU_WAIT;
@@ -584,7 +583,7 @@ module jacobian_point_op #(
 
                 ST_ADD_Z1_Z2: begin
                     fsm_mult_a     <= mult_result;
-                    fsm_mult_b     <= reg_a; // H (Re-almacenado o pasado)
+                    fsm_mult_b     <= reg_a; // H
                     fsm_mult_start <= 1'b1;
                     next_state     <= ST_ADD_Z3;
                     state          <= ST_MULT_WAIT;
@@ -654,11 +653,12 @@ module mod_add_sub_16bit #(
     localparam ST_SUB_P2     = 3'd5;
     localparam ST_DONE       = 3'd6;
 
-    reg [2:0] state;
-    reg [4:0] idx;
-    reg       carry_borrow;
-    reg [WIDTH-1:0] t_reg;
-    reg             t_carry;
+    reg [2:0]           state;
+    reg [4:0]           idx;
+    reg                 carry_borrow;
+    reg [WIDTH-1:0]     t_reg;
+    reg                 t_carry;
+    reg [WORD_SIZE+1:0] calc_res; // Variable de cálculo de 18 bits para evitar 'wire' procedurales
 
     wire [WORD_SIZE-1:0] a_w = a[idx*WORD_SIZE +: WORD_SIZE];
     wire [WORD_SIZE-1:0] b_w = b[idx*WORD_SIZE +: WORD_SIZE];
@@ -674,6 +674,7 @@ module mod_add_sub_16bit #(
             carry_borrow <= 1'b0;
             t_reg        <= {WIDTH{1'b0}};
             t_carry      <= 1'b0;
+            calc_res     <= {(WORD_SIZE+2){1'b0}};
         end else begin
             case (state)
                 ST_IDLE: begin
@@ -696,20 +697,15 @@ module mod_add_sub_16bit #(
                 // SUMA MODULAR: Paso 1 (S = A + B)
                 // ------------------------------------------------------------
                 ST_ADD_P1: begin
-                    begin
-                        wire [WORD_SIZE:0] sum_w = a_w + b_w + carry_borrow;
-                        t_reg[idx*WORD_SIZE +: WORD_SIZE] <= sum_w[WORD_SIZE-1:0];
-                        carry_borrow <= sum_w[WORD_SIZE];
-                    end
+                    calc_res = a_w + b_w + carry_borrow;
+                    t_reg[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
+                    carry_borrow <= calc_res[WORD_SIZE];
 
                     if (idx == NUM_WORDS - 1) begin
                         idx          <= 5'd0;
+                        t_carry      <= calc_res[WORD_SIZE];
                         carry_borrow <= 1'b0;
-                        begin
-                            wire [WORD_SIZE:0] sum_w = a_w + b_w + carry_borrow;
-                            t_carry <= sum_w[WORD_SIZE];
-                        end
-                        state <= ST_ADD_P2;
+                        state        <= ST_ADD_P2;
                     end else begin
                         idx <= idx + 1'b1;
                     end
@@ -720,9 +716,9 @@ module mod_add_sub_16bit #(
                 // ------------------------------------------------------------
                 ST_ADD_P2: begin
                     if (t_carry || (t_reg >= p)) begin
-                        wire [WORD_SIZE+1:0] diff_w = {1'b0, t_w} - {1'b0, p_w} - carry_borrow;
-                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
-                        carry_borrow <= diff_w[WORD_SIZE+1];
+                        calc_res = {1'b0, t_w} - {1'b0, p_w} - carry_borrow;
+                        result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
+                        carry_borrow <= calc_res[WORD_SIZE+1];
 
                         if (idx == NUM_WORDS - 1) begin
                             state <= ST_DONE;
@@ -739,11 +735,9 @@ module mod_add_sub_16bit #(
                 // RESTA MODULAR (A >= B): Result = A - B
                 // ------------------------------------------------------------
                 ST_SUB_DIRECT: begin
-                    begin
-                        wire [WORD_SIZE+1:0] diff_w = {1'b0, a_w} - {1'b0, b_w} - carry_borrow;
-                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
-                        carry_borrow <= diff_w[WORD_SIZE+1];
-                    end
+                    calc_res = {1'b0, a_w} - {1'b0, b_w} - carry_borrow;
+                    result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
+                    carry_borrow <= calc_res[WORD_SIZE+1];
 
                     if (idx == NUM_WORDS - 1) begin
                         state <= ST_DONE;
@@ -756,11 +750,9 @@ module mod_add_sub_16bit #(
                 // RESTA MODULAR (A < B): Paso 1 (T = A + P)
                 // ------------------------------------------------------------
                 ST_SUB_P1: begin
-                    begin
-                        wire [WORD_SIZE:0] sum_w = a_w + p_w + carry_borrow;
-                        t_reg[idx*WORD_SIZE +: WORD_SIZE] <= sum_w[WORD_SIZE-1:0];
-                        carry_borrow <= sum_w[WORD_SIZE];
-                    end
+                    calc_res = a_w + p_w + carry_borrow;
+                    t_reg[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
+                    carry_borrow <= calc_res[WORD_SIZE];
 
                     if (idx == NUM_WORDS - 1) begin
                         idx          <= 5'd0;
@@ -775,11 +767,9 @@ module mod_add_sub_16bit #(
                 // RESTA MODULAR (A < B): Paso 2 (Result = T - B)
                 // ------------------------------------------------------------
                 ST_SUB_P2: begin
-                    begin
-                        wire [WORD_SIZE+1:0] diff_w = {1'b0, t_w} - {1'b0, b_w} - carry_borrow;
-                        result[idx*WORD_SIZE +: WORD_SIZE] <= diff_w[WORD_SIZE-1:0];
-                        carry_borrow <= diff_w[WORD_SIZE+1];
-                    end
+                    calc_res = {1'b0, t_w} - {1'b0, b_w} - carry_borrow;
+                    result[idx*WORD_SIZE +: WORD_SIZE] <= calc_res[WORD_SIZE-1:0];
+                    carry_borrow <= calc_res[WORD_SIZE+1];
 
                     if (idx == NUM_WORDS - 1) begin
                         state <= ST_DONE;
