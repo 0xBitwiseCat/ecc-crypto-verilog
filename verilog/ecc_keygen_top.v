@@ -1,44 +1,34 @@
 // ============================================================================
-// Módulo: ecc_keygen_top.v (Top-Level Criptográfico)
-// Descripción: Orquestador principal para la generación de llave pública Q = k * G
-// Curva: secp256k1
-// Optimizado para: Intel Cyclone IV (Quartus Prime)
+// Módulo: ecc_keygen_top.v
+// Parámetro global WINDOW_SIZE = 6
 // ============================================================================
 
 module ecc_keygen_top #(
     parameter WIDTH       = 256,
-    parameter WINDOW_SIZE = 4,   // Ancho de ventana para precomputación
-    parameter WORD_SIZE   = 16   // Ancho de palabra para el multiplicador de Montgomery
+    parameter WINDOW_SIZE = 6,   // Configurado a 6 bits
+    parameter WORD_SIZE   = 16   
 )(
     input  wire             clk,
     input  wire             rst_n,
 
-    // Control
     input  wire             start,
     output reg              done,
 
-    // Entrada: Escalar k (256 bits)
     input  wire [WIDTH-1:0] k_scalar,
 
-    // Salida: Llave pública afín Q = (Qx, Qy) de 256 bits cada una
     output reg  [WIDTH-1:0] public_key_x,
     output reg  [WIDTH-1:0] public_key_y
 );
 
-    // ------------------------------------------------------------------------
-    // CONSTANTES DE LA CURVA secp256k1 (Dominio Afín y Montgomery)
-    // ------------------------------------------------------------------------
+    // Constantes de la curva secp256k1
     localparam [WIDTH-1:0] P_PARAM  = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
     localparam [WIDTH-1:0] A_PARAM  = 256'h0000000000000000000000000000000000000000000000000000000000000000;
     localparam [WIDTH-1:0] B_PARAM  = 256'h0000000000000000000000000000000000000000000000000000000000000007;
     localparam [WIDTH-1:0] GX_PARAM = 256'h79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798;
     localparam [WIDTH-1:0] GY_PARAM = 256'h483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8;
-    localparam [WIDTH-1:0] R2_PARAM = 256'h00000001000003D1000000000000000000000000000000000000000000000000; // (2^256)^2 mod P
-    localparam [15:0]      N_PRIME0 = 16'h2ECD; // (-P^-1) mod 2^16 para secp256k1
+    localparam [WIDTH-1:0] R2_PARAM = 256'h00000001000003D1000000000000000000000000000000000000000000000000;
+    localparam [15:0]      N_PRIME0 = 16'h2ECD;
 
-    // ------------------------------------------------------------------------
-    // ESTADOS DE LA FSM CONTROLADORA PRINCIPAL
-    // ------------------------------------------------------------------------
     localparam ST_IDLE       = 3'b000;
     localparam ST_CONVERT    = 3'b001;
     localparam ST_PRECOMPUTE = 3'b010;
@@ -49,54 +39,38 @@ module ecc_keygen_top #(
 
     reg [2:0] state;
 
-    // ------------------------------------------------------------------------
-    // SEÑALES DE INTERCONEXIÓN Y MUX DE MULTIPLICADOR COMPARTIDO
-    // ------------------------------------------------------------------------
+    // Bus de interconexión
     reg              mult_start;
-    wire             mult_done;
-    wire             mult_busy;
-    reg  [WIDTH-1:0] mult_a;
-    reg  [WIDTH-1:0] mult_b;
+    wire             mult_done, mult_busy;
+    reg  [WIDTH-1:0] mult_a, mult_b;
     wire [WIDTH-1:0] mult_result;
 
-    // Submódulo 1: Conversor de Dominio
     reg              conv_start;
-    wire             conv_done;
-    wire             conv_busy;
+    wire             conv_done, conv_busy;
     wire [WIDTH-1:0] gx_mont, gy_mont;
     wire             conv_mult_start;
     wire [WIDTH-1:0] conv_mult_a, conv_mult_b;
 
-    // Submódulo 2: Precomputación de Puntos Impares
     reg              precomp_start;
-    wire             precomp_done;
-    wire             precomp_busy;
-    wire             precomp_ram_we;
-    wire [WINDOW_SIZE-1:0] precomp_ram_waddr;
-    wire [WIDTH-1:0] precomp_ram_din;
+    wire             precomp_done, precomp_busy, precomp_ram_we;
+    wire [WINDOW_SIZE-2:0] precomp_ram_waddr;
+    wire [WIDTH-1:0]       precomp_ram_din;
 
-    // Submódulo 3: Memoria RAM M9K (ecc_point_ram)
-    wire [WINDOW_SIZE-1:0] ram_raddr;
+    wire [WINDOW_SIZE-2:0] ram_raddr;
     wire [WIDTH-1:0]       ram_dout;
 
-    // Submódulo 4: Motor de Ventana Deslizante (ecc_sliding_window_engine)
     reg              sw_start;
-    wire             sw_done;
-    wire             sw_busy;
+    wire             sw_done, sw_busy;
     wire [WIDTH-1:0] jacob_x, jacob_y, jacob_z;
 
-    // Submódulo 5: Inversor Modular de Fermat
     reg              inv_start;
-    wire             inv_done;
-    wire             inv_busy;
+    wire             inv_done, inv_busy;
     wire [WIDTH-1:0] z_inv_mont;
     wire             inv_mult_start;
     wire [WIDTH-1:0] inv_mult_a, inv_mult_b;
 
-    // Submódulo 6 & 7: ALU de Puntos (Point Add & Point Double)
     reg              add_start, dbl_start;
-    wire             add_done, dbl_done;
-    wire             add_busy, dbl_busy;
+    wire             add_done, dbl_done, add_busy, dbl_busy;
     wire [WIDTH-1:0] add_x1, add_y1, add_z1, add_x2, add_y2, add_z2;
     wire [WIDTH-1:0] dbl_x1, dbl_y1, dbl_z1;
     wire [WIDTH-1:0] add_x3, add_y3, add_z3;
@@ -104,14 +78,10 @@ module ecc_keygen_top #(
     wire             add_mult_start, dbl_mult_start;
     wire [WIDTH-1:0] add_mult_a, add_mult_b, dbl_mult_a, dbl_mult_b;
 
-    // ------------------------------------------------------------------------
-    // INSTANCIACIÓN DE SUBMÓDULOS
-    // ------------------------------------------------------------------------
-
-    // 1. Memoria RAM M9K
+    // 1. Memoria RAM M9K (32 palabras de 256 bits para w=6)
     ecc_point_ram #(
         .DATA_WIDTH(WIDTH),
-        .ADDR_WIDTH(WINDOW_SIZE)
+        .ADDR_WIDTH(WINDOW_SIZE - 1)
     ) point_ram_inst (
         .clk       (clk),
         .we        (precomp_ram_we),
@@ -121,7 +91,7 @@ module ecc_keygen_top #(
         .data_out  (ram_dout)
     );
 
-    // 2. Multiplicador de Montgomery Compartido
+    // 2. Multiplicador de Montgomery
     montgomery_multiplier #(
         .WIDTH    (WIDTH),
         .WORD_SIZE(WORD_SIZE)
@@ -138,7 +108,7 @@ module ecc_keygen_top #(
         .result  (mult_result)
     );
 
-    // 3. Conversor de Coordenadas de Dominio
+    // 3. Conversor de Dominio
     domain_coordinate_converter #(
         .W(WIDTH)
     ) domain_conv_inst (
@@ -160,7 +130,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 4. FSM de Precomputación de Puntos Impares
+    // 4. Precomputación (w = 6)
     ecc_precompute_fsm #(
         .WIDTH      (WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
@@ -178,7 +148,7 @@ module ecc_keygen_top #(
         .ram_din    (precomp_ram_din)
     );
 
-    // 5. Motor de Ventana Deslizante
+    // 5. Motor de Ventana Deslizante (w = 6)
     ecc_sliding_window_engine #(
         .WIDTH      (WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
@@ -197,7 +167,7 @@ module ecc_keygen_top #(
         .z_out      (jacob_z)
     );
 
-    // 6. Sumador Modular de Puntos
+    // 6. Sumador Modular
     jacobian_point_add #(
         .WIDTH(WIDTH)
     ) point_add_inst (
@@ -218,7 +188,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 7. Duplicador Modular de Puntos
+    // 7. Duplicador Modular
     jacobian_point_double #(
         .WIDTH(WIDTH)
     ) point_dbl_inst (
@@ -238,7 +208,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 8. Inversor Modular Fermat
+    // 8. Inversor Fermat
     fermat_inverter #(
         .WIDTH(WIDTH)
     ) fermat_inv_inst (
@@ -257,9 +227,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // ------------------------------------------------------------------------
-    // MULTIPLEXACIÓN DEL MULTIPLICADOR DE MONTGOMERY COMPARTIDO
-    // ------------------------------------------------------------------------
+    // Árbitro de la ALU compartida
     always @(*) begin
         if (conv_busy) begin
             mult_start = conv_mult_start;
@@ -284,9 +252,7 @@ module ecc_keygen_top #(
         end
     end
 
-    // ------------------------------------------------------------------------
-    // FSM PRINCIPAL
-    // ------------------------------------------------------------------------
+    // FSM Principal
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state        <= ST_IDLE;
