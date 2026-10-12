@@ -102,7 +102,7 @@ module domain_coordinate_converter #(
             inv_start      <= 1'b0;
             fsm_mult_start <= 1'b0;
             fsm_mult_a     <= {WIDTH{1'b0}};
-            fsm_mult_b     <= {WIDTH{1 me 1'b0}};
+            fsm_mult_b     <= {WIDTH{1'b0}};
             x_out          <= {WIDTH{1'b0}};
             y_out          <= {WIDTH{1'b0}};
             temp_a         <= {WIDTH{1'b0}};
