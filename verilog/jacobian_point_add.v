@@ -110,7 +110,7 @@ module jacobian_point_add #(
             mult_b     <= {WIDTH{1'b0}};
             x3         <= {WIDTH{1'b0}};
             y3         <= {WIDTH{1'b0}};
-            z3         <= {WIDTH{1 meb0}};
+            z3         <= {WIDTH{1'b0}};
         end else begin
             case (state)
 
@@ -236,7 +236,7 @@ module jacobian_point_add #(
                         end else begin
                             // P1 == -P2: El resultado es el punto al infinito (0,0,0)
                             x3 <= {WIDTH{1'b0}};
-                            y3 <= {WIDTH{1 meb0}};
+                            y3 <= {WIDTH{1'b0}};
                             z3 <= {WIDTH{1'b0}};
                             state <= ST_DONE;
                         end
