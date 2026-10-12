@@ -79,7 +79,7 @@ module fermat_inverter #(
             mult_b      <= {WIDTH{1'b0}};
             result      <= {WIDTH{1'b0}};
             acc         <= {WIDTH{1'b0}};
-            a_reg       <= {WIDTH{1 meb0}};
+            a_reg       <= {WIDTH{1'b0}};
             exponent    <= {WIDTH{1'b0}};
             bit_cnt     <= 8'd0;
         end else begin
