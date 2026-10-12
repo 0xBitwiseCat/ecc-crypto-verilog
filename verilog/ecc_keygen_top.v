@@ -28,13 +28,13 @@ module ecc_keygen_top #(
     // ------------------------------------------------------------------------
     // CONSTANTES DE LA CURVA secp256k1 (Dominio Afín y Montgomery)
     // ------------------------------------------------------------------------
-    localparam [WIDTH-1:0] P_PARAM       = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
-    localparam [WIDTH-1:0] A_PARAM       = 256'h0000000000000000000000000000000000000000000000000000000000000000;
-    localparam [WIDTH-1:0] B_PARAM       = 256'h0000000000000000000000000000000000000000000000000000000000000007;
-    localparam [WIDTH-1:0] GX_PARAM      = 256'h79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798;
-    localparam [WIDTH-1:0] GY_PARAM      = 256'h483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8;
-    localparam [WIDTH-1:0] R2_PARAM      = 256'h00000001000003D1000000000000000000000000000000000000000000000000; // (2^256)^2 mod P
-    localparam [15:0]      N_PRIME0      = 16'h2ECD; // (-P^-1) mod 2^16 para secp256k1
+    localparam [WIDTH-1:0] P_PARAM  = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
+    localparam [WIDTH-1:0] A_PARAM  = 256'h0000000000000000000000000000000000000000000000000000000000000000;
+    localparam [WIDTH-1:0] B_PARAM  = 256'h0000000000000000000000000000000000000000000000000000000000000007;
+    localparam [WIDTH-1:0] GX_PARAM = 256'h79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798;
+    localparam [WIDTH-1:0] GY_PARAM = 256'h483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8;
+    localparam [WIDTH-1:0] R2_PARAM = 256'h00000001000003D1000000000000000000000000000000000000000000000000; // (2^256)^2 mod P
+    localparam [15:0]      N_PRIME0 = 16'h2ECD; // (-P^-1) mod 2^16 para secp256k1
 
     // ------------------------------------------------------------------------
     // ESTADOS DE LA FSM CONTROLADORA PRINCIPAL
@@ -104,11 +104,8 @@ module ecc_keygen_top #(
     wire             add_mult_start, dbl_mult_start;
     wire [WIDTH-1:0] add_mult_a, add_mult_b, dbl_mult_a, dbl_mult_b;
 
-    // Registros temporales para la conversión final a afín
-    reg [WIDTH-1:0]  z_inv_sq, z_inv_cu;
-
     // ------------------------------------------------------------------------
-    // INSTANCIACIÓN DE SUBMÓDULOS CON NOMBRES DE PARÁMETROS CORREGIDOS
+    // INSTANCIACIÓN DE SUBMÓDULOS CON NOMBRES DE PARÁMETROS ESPECÍFICOS
     // ------------------------------------------------------------------------
 
     // 1. Memoria RAM M9K
@@ -141,9 +138,9 @@ module ecc_keygen_top #(
         .result  (mult_result)
     );
 
-    // 3. Conversor de Coordenadas de Dominio
+    // 3. Conversor de Coordenadas de Dominio (Usa el parámetro W)
     domain_coordinate_converter #(
-        .WIDTH(WIDTH)
+        .W(WIDTH)
     ) domain_conv_inst (
         .clk        (clk),
         .rst_n      (rst_n),
@@ -163,7 +160,44 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 4. Sumador Modular de Puntos
+    // 4. FSM de Precomputación de Puntos Impares (1G, 3G, 5G...)
+    ecc_precompute_fsm #(
+        .WIDTH      (WIDTH),
+        .WINDOW_SIZE(WINDOW_SIZE)
+    ) precomp_inst (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .start      (precomp_start),
+        .done       (precomp_done),
+        .busy       (precomp_busy),
+        .gx_mont    (gx_mont),
+        .gy_mont    (gy_mont),
+        .p          (P_PARAM),
+        .ram_we     (precomp_ram_we),
+        .ram_waddr  (precomp_ram_waddr),
+        .ram_din    (precomp_ram_din)
+    );
+
+    // 5. Motor de Ventana Deslizante (Sliding Window Engine)
+    ecc_sliding_window_engine #(
+        .WIDTH      (WIDTH),
+        .WINDOW_SIZE(WINDOW_SIZE)
+    ) sw_engine_inst (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .start      (sw_start),
+        .done       (sw_done),
+        .busy       (sw_busy),
+        .k_scalar   (k_scalar),
+        .p          (P_PARAM),
+        .ram_raddr  (ram_raddr),
+        .ram_dout   (ram_dout),
+        .x_out      (jacob_x),
+        .y_out      (jacob_y),
+        .z_out      (jacob_z)
+    );
+
+    // 6. Sumador Modular de Puntos
     jacobian_point_add #(
         .WIDTH(WIDTH)
     ) point_add_inst (
@@ -184,7 +218,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 5. Duplicador Modular de Puntos
+    // 7. Duplicador Modular de Puntos
     jacobian_point_double #(
         .WIDTH(WIDTH)
     ) point_dbl_inst (
@@ -204,7 +238,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 6. Inversor Modular Fermat
+    // 8. Inversor Modular Fermat
     fermat_inverter #(
         .WIDTH(WIDTH)
     ) fermat_inv_inst (
@@ -301,13 +335,11 @@ module ecc_keygen_top #(
                 ST_CONV_AFFINE: begin
                     inv_start <= 1'b0;
                     if (inv_done) begin
-                        // Mapeo final de coordenadas Jacobianas a Afines: x = X / Z^2, y = Y / Z^3
                         state <= ST_MAP_FINAL;
                     end
                 end
 
                 ST_MAP_FINAL: begin
-                    // Salida directa de coordenadas mapeadas
                     public_key_x <= jacob_x;
                     public_key_y <= jacob_y;
                     state        <= ST_DONE;
