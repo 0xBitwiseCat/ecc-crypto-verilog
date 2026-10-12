@@ -104,16 +104,22 @@ module jacobian_point_op #(
 
     // ------------------------------------------------------------------------
     // Unidad Aritmética Modular Única Compartida (Suma / Resta)
+    // Se emplean señales intermedias para evitar truncamientos e incompatibilidad
+    // de slicing directo sobre operaciones en Quartus.
     // ------------------------------------------------------------------------
     reg  [WIDTH-1:0] add_in_a, add_in_b;
     wire [WIDTH-1:0] add_out;
     reg  [WIDTH-1:0] sub_in_a, sub_in_b;
     wire [WIDTH-1:0] sub_out;
 
-    wire [WIDTH:0] add_sum  = add_in_a + add_in_b;
-    assign add_out = (add_sum >= p) ? (add_sum - p) : add_sum[WIDTH-1:0];
+    wire [WIDTH:0] add_sum = add_in_a + add_in_b;
+    wire [WIDTH:0] add_sub = add_sum - p;
+    assign add_out = (add_sum >= p) ? add_sub[WIDTH-1:0] : add_sum[WIDTH-1:0];
 
-    wire [WIDTH:0] sub_diff = (sub_in_a >= sub_in_b) ? (sub_in_a - sub_in_b) : ((sub_in_a + p) - sub_in_b);
+    wire [WIDTH:0] sub_diff1  = sub_in_a - sub_in_b;
+    wire [WIDTH:0] sub_plus_p = sub_in_a + p;
+    wire [WIDTH:0] sub_diff2  = sub_plus_p - sub_in_b;
+    wire [WIDTH:0] sub_diff   = (sub_in_a >= sub_in_b) ? sub_diff1 : sub_diff2;
     assign sub_out = sub_diff[WIDTH-1:0];
 
     // ------------------------------------------------------------------------

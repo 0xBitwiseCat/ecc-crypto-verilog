@@ -69,17 +69,45 @@ module ecc_keygen_top #(
     wire [WINDOW_SIZE-2:0]  ram_raddr;
     wire [WIDTH-1:0]        ram_dout_x, ram_dout_y;
 
-    // Control de Interfaz con Precomputador
+    // Señales de salida independientes del Precomputador (evita múltiples drivers)
+    wire        precomp_dbl_start, precomp_add_start;
+    wire [WIDTH-1:0] precomp_dbl_x1, precomp_dbl_y1, precomp_dbl_z1;
+    wire [WIDTH-1:0] precomp_add_x1, precomp_add_y1, precomp_add_z1;
+    wire [WIDTH-1:0] precomp_add_x2, precomp_add_y2, precomp_add_z2;
+
+    // Multiplexado interno de salidas del Precomputador
     wire        precomp_op_start;
     wire        precomp_op_type;
     wire [WIDTH-1:0] precomp_op_x1, precomp_op_y1, precomp_op_z1;
     wire [WIDTH-1:0] precomp_op_x2, precomp_op_y2, precomp_op_z2;
 
-    // Control de Interfaz con Motor de Ventana
+    assign precomp_op_start = precomp_op_type ? precomp_dbl_start : precomp_add_start;
+    assign precomp_op_x1    = precomp_op_type ? precomp_dbl_x1    : precomp_add_x1;
+    assign precomp_op_y1    = precomp_op_type ? precomp_dbl_y1    : precomp_add_y1;
+    assign precomp_op_z1    = precomp_op_type ? precomp_dbl_z1    : precomp_add_z1;
+    assign precomp_op_x2    = precomp_add_x2;
+    assign precomp_op_y2    = precomp_add_y2;
+    assign precomp_op_z2    = precomp_add_z2;
+
+    // Señales de salida independientes del Motor de Ventana (evita múltiples drivers)
+    wire        sw_add_start, sw_dbl_start;
+    wire [WIDTH-1:0] sw_add_x1, sw_add_y1, sw_add_z1;
+    wire [WIDTH-1:0] sw_add_x2, sw_add_y2, sw_add_z2;
+    wire [WIDTH-1:0] sw_dbl_x1, sw_dbl_y1, sw_dbl_z1;
+
+    // Multiplexado interno de salidas del Motor de Ventana
     wire        sw_op_start;
     wire        sw_op_type;
     wire [WIDTH-1:0] sw_op_x1, sw_op_y1, sw_op_z1;
     wire [WIDTH-1:0] sw_op_x2, sw_op_y2, sw_op_z2;
+
+    assign sw_op_start = sw_op_type ? sw_dbl_start : sw_add_start;
+    assign sw_op_x1    = sw_op_type ? sw_dbl_x1    : sw_add_x1;
+    assign sw_op_y1    = sw_op_type ? sw_dbl_y1    : sw_add_y1;
+    assign sw_op_z1    = sw_op_type ? sw_dbl_z1    : sw_add_z1;
+    assign sw_op_x2    = sw_add_x2;
+    assign sw_op_y2    = sw_add_y2;
+    assign sw_op_z2    = sw_add_z2;
 
     // Señales del Operador Jacobiano Unificado (jacobian_point_op)
     wire        op_start;
@@ -140,40 +168,40 @@ module ecc_keygen_top #(
         .dout_y(ram_dout_y)
     );
 
-   // Instancia de Precomputación conectada con op_type explícito
+    // 2. Instancia de Precomputación
     ecc_precompute_fsm #(
         .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) precomp_inst (
         .clk(clk), .rst_n(rst_n),
         .start(precomp_start), .done(precomp_done), .busy(precomp_busy),
-        .op_type(precomp_op_type), // Conexión directa
+        .op_type(precomp_op_type),
         .gx_mont(GX_MONT), .gy_mont(GY_MONT), .p(SECP256K1_P),
         .ram_we(ram_we), .ram_waddr(ram_waddr),
         .ram_din_x(ram_din_x), .ram_din_y(ram_din_y),
-        .dbl_start(precomp_op_start), .dbl_done(op_done && precomp_busy),
-        .dbl_x1(precomp_op_x1), .dbl_y1(precomp_op_y1), .dbl_z1(precomp_op_z1),
+        .dbl_start(precomp_dbl_start), .dbl_done(op_done && precomp_busy),
+        .dbl_x1(precomp_dbl_x1), .dbl_y1(precomp_dbl_y1), .dbl_z1(precomp_dbl_z1),
         .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
-        .add_start(precomp_op_start), .add_done(op_done && precomp_busy),
-        .add_x1(precomp_op_x1), .add_y1(precomp_op_y1), .add_z1(precomp_op_z1),
-        .add_x2(precomp_op_x2), .add_y2(precomp_op_y2), .add_z2(precomp_op_z2),
+        .add_start(precomp_add_start), .add_done(op_done && precomp_busy),
+        .add_x1(precomp_add_x1), .add_y1(precomp_add_y1), .add_z1(precomp_add_z1),
+        .add_x2(precomp_add_x2), .add_y2(precomp_add_y2), .add_z2(precomp_add_z2),
         .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3)
     );
 
-    // Instancia del Motor de Ventana conectada con op_type explícito
+    // 3. Instancia del Motor de Ventana
     ecc_sliding_window_engine #(
         .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) sw_engine_inst (
         .clk(clk), .rst_n(rst_n),
         .start(sw_start), .done(sw_done), .busy(sw_busy),
-        .op_type(sw_op_type), // Conexión directa
+        .op_type(sw_op_type),
         .k_scalar(k_scalar), .p(SECP256K1_P),
         .ram_raddr(ram_raddr), .ram_dout_x(ram_dout_x), .ram_dout_y(ram_dout_y),
-        .add_start(sw_op_start), .add_done(op_done && sw_busy),
-        .add_x1(sw_op_x1), .add_y1(sw_op_y1), .add_z1(sw_op_z1),
-        .add_x2(sw_op_x2), .add_y2(sw_op_y2), .add_z2(sw_op_z2),
+        .add_start(sw_add_start), .add_done(op_done && sw_busy),
+        .add_x1(sw_add_x1), .add_y1(sw_add_y1), .add_z1(sw_add_z1),
+        .add_x2(sw_add_x2), .add_y2(sw_add_y2), .add_z2(sw_add_z2),
         .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3),
-        .dbl_start(sw_op_start), .dbl_done(op_done && sw_busy),
-        .dbl_x1(sw_op_x1), .dbl_y1(sw_op_y1), .dbl_z1(sw_op_z1),
+        .dbl_start(sw_dbl_start), .dbl_done(op_done && sw_busy),
+        .dbl_x1(sw_dbl_x1), .dbl_y1(sw_dbl_y1), .dbl_z1(sw_dbl_z1),
         .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
         .x_out(sw_x), .y_out(sw_y), .z_out(sw_z)
     );

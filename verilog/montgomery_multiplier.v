@@ -60,6 +60,9 @@ module montgomery_multiplier #(
     wire [WORD_SIZE-1:0] b_word = b[j*WORD_SIZE +: WORD_SIZE];
     wire [WORD_SIZE-1:0] p_word = p[j*WORD_SIZE +: WORD_SIZE];
 
+    // Señal intermedia de multiplicación para evitar truncamiento implícito (Warning 10230)
+    wire [31:0] m_prod = t[0] * n_prime0;
+
     integer k;
 
     // ------------------------------------------------------------------------
@@ -125,7 +128,7 @@ module montgomery_multiplier #(
                     t[NUM_WORDS] <= acc[WORD_SIZE-1:0];
                     
                     // m = (T[0] * n_prime0) mod 2^16
-                    m    <= t[0] * n_prime0;
+                    m    <= m_prod[WORD_SIZE-1:0];
                     j    <= 5'd0;
                     state<= ST_REDUCE;
                 end
@@ -173,6 +176,7 @@ module montgomery_multiplier #(
                     // Reconstruir vector completo de 256 bits desde t[]
                     begin: build_res
                         reg [WIDTH:0] temp_t;
+                        reg [WIDTH:0] temp_sub;
                         integer x;
                         temp_t = 0;
                         for (x = 0; x < NUM_WORDS; x = x + 1) begin
@@ -180,9 +184,11 @@ module montgomery_multiplier #(
                         end
                         temp_t[WIDTH] = t[NUM_WORDS][0];
 
+                        temp_sub = temp_t - p;
+
                         // Si T >= P, Result = T - P; en otro caso, Result = T
                         if (temp_t >= p) begin
-                            result <= temp_t - p;
+                            result <= temp_sub[WIDTH-1:0];
                         end else begin
                             result <= temp_t[WIDTH-1:0];
                         end
