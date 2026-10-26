@@ -1,8 +1,14 @@
 // ============================================================================
-// Módulo: jacobian_point_op.v (CORREGIDO)
+// Módulo: jacobian_point_op.v (MICROPROGRAMADO)
 // Descripción: Operador Geométrico-Jacobiano Unificado (Adición y Doblamiento)
 //              para secp256k1 (a=0) en Dominio Montgomery.
-// Optimización: ALU Modular Pipelined de 256 bits en 2 ciclos.
+// Arquitectura: Secuenciador microprogramado (6 estados + PC + ROM) sobre un
+//               datapath único de dos buses de operandos:
+//                 - Bus A: entradas (x1,y1,z1,x2,y2,z2), acumulador ACC o 0
+//                 - Bus B: temporales (T0,T1), salidas (X3,Y3,Z3), copia de A o 0
+//               Las salidas x3/y3/z3 se reutilizan como temporales: los
+//               llamadores sólo las muestrean cuando 'done' = 1.
+// ALU Modular: 3 ciclos, un solo sumador de 257 bits por etapa.
 // Optimizado para: Intel Cyclone IV (EP4CE6E22C8)
 // ============================================================================
 
@@ -20,11 +26,12 @@ module jacobian_point_op #(
     output reg                  is_double, // Detecta P == Q durante Adición
 
     // Coordenadas Jacobianas de Entrada (Montgomery)
+    // Deben mantenerse estables mientras busy = 1
     input  wire [WIDTH-1:0]     x1, y1, z1,
     input  wire [WIDTH-1:0]     x2, y2, z2, // Requerido solo para op_type = 0
     input  wire [WIDTH-1:0]     p,
 
-    // Coordenadas Jacobianas de Salida
+    // Coordenadas Jacobianas de Salida (válidas cuando done = 1)
     output reg  [WIDTH-1:0]     x3, y3, z3,
 
     // Interfaz con el multiplicador de Montgomery compartido
@@ -36,675 +43,328 @@ module jacobian_point_op #(
 );
 
     // ------------------------------------------------------------------------
-    // Codificación de Estados de la FSM
+    // Estados del Secuenciador
     // ------------------------------------------------------------------------
-    localparam ST_IDLE          = 6'd0;
-    localparam ST_CHECK_INF     = 6'd1;
-
-    // Estados de Doblamiento (op_type == 1)
-    localparam ST_DBL_XX        = 6'd2;
-    localparam ST_DBL_YY        = 6'd3;
-    localparam ST_DBL_YYYY      = 6'd4;
-    localparam ST_DBL_M_PREP    = 6'd5;
-    localparam ST_DBL_M_FINAL   = 6'd6;
-    localparam ST_DBL_X1_YY     = 6'd7;
-    localparam ST_DBL_S_PREP    = 6'd8;
-    localparam ST_DBL_S_CALC    = 6'd9;
-    localparam ST_DBL_M2        = 6'd10;
-    localparam ST_DBL_2S        = 6'd11;
-    localparam ST_DBL_X3        = 6'd12;
-    localparam ST_DBL_Y1_Z1     = 6'd13;
-    localparam ST_DBL_Z3        = 6'd14;
-    localparam ST_DBL_S_MINUS_X3= 6'd15;
-    localparam ST_DBL_M_S_X3    = 6'd16;
-    localparam ST_DBL_8YYYY_1   = 6'd17;
-    localparam ST_DBL_8YYYY_2   = 6'd18;
-    localparam ST_DBL_8YYYY_3   = 6'd19;
-    localparam ST_DBL_Y3        = 6'd20;
-
-    // Estados de Adición (op_type == 0)
-    localparam ST_ADD_Z1_SQ     = 6'd21;
-    localparam ST_ADD_Z2_SQ     = 6'd22;
-    localparam ST_ADD_U1        = 6'd23;
-    localparam ST_ADD_U2        = 6'd24;
-    localparam ST_ADD_CALC_H    = 6'd25;
-    localparam ST_ADD_Z1_CU     = 6'd26;
-    localparam ST_ADD_S2        = 6'd27;
-    localparam ST_ADD_Z2_CU     = 6'd28;
-    localparam ST_ADD_S1        = 6'd29;
-    localparam ST_ADD_CALC_R    = 6'd30;
-    localparam ST_ADD_H2        = 6'd31;
-    localparam ST_ADD_H3        = 6'd32;
-    localparam ST_ADD_V         = 6'd33;
-    localparam ST_ADD_R2        = 6'd34;
-    localparam ST_ADD_X3_PREP   = 6'd35;
-    localparam ST_ADD_2V        = 6'd36;
-    localparam ST_ADD_X3_FINAL  = 6'd37;
-    localparam ST_ADD_V_X3      = 6'd38;
-    localparam ST_ADD_R_VX3     = 6'd39;
-    localparam ST_ADD_S1_H3     = 6'd40;
-    localparam ST_ADD_Y3        = 6'd41;
-    localparam ST_ADD_Z1_Z2     = 6'd42;
-    localparam ST_ADD_Z3        = 6'd43;
-
-    localparam ST_MULT_WAIT     = 6'd44;
-    localparam ST_ALU_WAIT      = 6'd45;
-    localparam ST_DONE          = 6'd46;
-
-    reg [5:0] state, next_state, alu_next_state;
-
-    // Banco de Registros Temporales Compartidos
-    reg [WIDTH-1:0] t1, t2, t3;
-    reg [WIDTH-1:0] reg_a, reg_b, reg_c;
-
-    // Control FSM del Multiplicador
-    reg             fsm_mult_start;
-    reg [WIDTH-1:0] fsm_mult_a;
-    reg [WIDTH-1:0] fsm_mult_b;
-
-    assign mult_start = fsm_mult_start;
-    assign mult_a     = fsm_mult_a;
-    assign mult_b     = fsm_mult_b;
+    localparam [2:0] S_IDLE  = 3'd0;
+    localparam [2:0] S_EXEC  = 3'd1;  // Decodifica, registra operandos, salta
+    localparam [2:0] S_MWAIT = 3'd2;  // Espera al multiplicador y escribe
+    localparam [2:0] S_ALU1  = 3'd3;  // Etapa 1 de la ALU (suma/resta)
+    localparam [2:0] S_AWB   = 3'd4;  // Etapa 2 de la ALU (corrección mod p)
+    localparam [2:0] S_WB    = 3'd5;  // Escribe el resultado de la ALU
 
     // ------------------------------------------------------------------------
-    // Unidad Aritmética Modular de 256 bits (ALU Pipelined de 2 ciclos)
+    // Formato de Microinstrucción: {op[14:12], a[11:9], b[8:6], dst[5:0]}
+    //   OP_BZ : dst = dirección de salto si A == 0
+    //   OP_INF: b[0] = 1 -> is_double <= (A == 0)
     // ------------------------------------------------------------------------
-    reg                 alu_start;
-    reg                 alu_op; // 0: ADD, 1: SUB
-    reg  [WIDTH-1:0]    alu_a;
-    reg  [WIDTH-1:0]    alu_b;
-    wire                alu_done;
-    wire [WIDTH-1:0]    alu_result;
+    localparam [2:0] OP_MUL = 3'd0;  // dst <- A * B (Montgomery)
+    localparam [2:0] OP_ADD = 3'd1;  // dst <- (A + B) mod p
+    localparam [2:0] OP_SUB = 3'd2;  // dst <- (A - B) mod p
+    localparam [2:0] OP_BZ  = 3'd3;  // if (A == 0) pc <- dst
+    localparam [2:0] OP_INF = 3'd4;  // (x3,y3,z3) <- 0, fin
+    localparam [2:0] OP_END = 3'd5;  // fin
 
-    mod_add_sub_256 #(
-        .WIDTH(WIDTH)
-    ) alu_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(alu_start),
-        .op(alu_op),
-        .a(alu_a),
-        .b(alu_b),
-        .p(p),
-        .done(alu_done),
-        .result(alu_result)
-    );
+    // Fuentes del bus A
+    localparam [2:0] A_X1  = 3'd0;
+    localparam [2:0] A_Y1  = 3'd1;
+    localparam [2:0] A_Z1  = 3'd2;
+    localparam [2:0] A_X2  = 3'd3;
+    localparam [2:0] A_Y2  = 3'd4;
+    localparam [2:0] A_Z2  = 3'd5;
+    localparam [2:0] A_ACC = 3'd6;
+    localparam [2:0] A_0   = 3'd7;
+
+    // Fuentes del bus B
+    localparam [2:0] B_T0  = 3'd0;
+    localparam [2:0] B_T1  = 3'd1;
+    localparam [2:0] B_X3  = 3'd2;
+    localparam [2:0] B_Y3  = 3'd3;
+    localparam [2:0] B_Z3  = 3'd4;
+    localparam [2:0] B_CPY = 3'd5;   // B = A (cuadrados y duplicaciones)
+    localparam [2:0] B_0   = 3'd6;
+
+    // Máscara de destinos (se permiten escrituras múltiples)
+    localparam [5:0] D_NONE = 6'b000000;
+    localparam [5:0] D_ACC  = 6'b000001;
+    localparam [5:0] D_T0   = 6'b000010;
+    localparam [5:0] D_T1   = 6'b000100;
+    localparam [5:0] D_X3   = 6'b001000;
+    localparam [5:0] D_Y3   = 6'b010000;
+    localparam [5:0] D_Z3   = 6'b100000;
+
+    // Puntos de entrada del microprograma
+    localparam [5:0] PC_DBL  = 6'd0;
+    localparam [5:0] PC_ADD  = 6'd22;
+    localparam [5:0] PC_HZ   = 6'd51;
+    localparam [5:0] PC_INF  = 6'd53;
+    localparam [5:0] PC_RET2 = 6'd54;
+    localparam [5:0] PC_RET1 = 6'd58;
 
     // ------------------------------------------------------------------------
-    // FSM Principal
+    // Microprograma
     // ------------------------------------------------------------------------
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state          <= ST_IDLE;
-            next_state     <= ST_IDLE;
-            alu_next_state <= ST_IDLE;
-            done           <= 1'b0;
-            busy           <= 1'b0;
-            is_double      <= 1'b0;
-            fsm_mult_start <= 1'b0;
-            fsm_mult_a     <= {WIDTH{1'b0}};
-            fsm_mult_b     <= {WIDTH{1'b0}};
-            alu_start      <= 1'b0;
-            alu_op         <= 1'b0;
-            alu_a          <= {WIDTH{1'b0}};
-            alu_b          <= {WIDTH{1'b0}};
-            x3             <= {WIDTH{1'b0}};
-            y3             <= {WIDTH{1'b0}};
-            z3             <= {WIDTH{1'b0}};
-            t1             <= {WIDTH{1'b0}};
-            t2             <= {WIDTH{1'b0}};
-            t3             <= {WIDTH{1'b0}};
-            reg_a          <= {WIDTH{1'b0}};
-            reg_b          <= {WIDTH{1'b0}};
-            reg_c          <= {WIDTH{1'b0}};
-        end else begin
-            case (state)
+    function [14:0] ucode;
+        input [5:0] addr;
+        case (addr)
+            // ===== DOBLAMIENTO: M=3XX, S=4*X1*YY, X3=M^2-2S,
+            //       Y3=M(S-X3)-8YYYY, Z3=2*Y1*Z1 =====
+            6'd0:  ucode = {OP_BZ,  A_Z1,  B_0,   PC_INF};      // Z1 == 0 -> infinito
+            6'd1:  ucode = {OP_MUL, A_Y1,  B_CPY, D_ACC|D_T1};  // YY
+            6'd2:  ucode = {OP_MUL, A_ACC, B_CPY, D_ACC};       // YYYY
+            6'd3:  ucode = {OP_ADD, A_ACC, B_CPY, D_ACC};       // 2YYYY
+            6'd4:  ucode = {OP_ADD, A_ACC, B_CPY, D_ACC};       // 4YYYY
+            6'd5:  ucode = {OP_ADD, A_ACC, B_CPY, D_Z3};        // 8YYYY
+            6'd6:  ucode = {OP_MUL, A_X1,  B_T1,  D_ACC};       // X1*YY
+            6'd7:  ucode = {OP_ADD, A_ACC, B_CPY, D_ACC};       // 2*X1*YY
+            6'd8:  ucode = {OP_ADD, A_ACC, B_CPY, D_T1};        // S
+            6'd9:  ucode = {OP_MUL, A_X1,  B_CPY, D_ACC};       // XX
+            6'd10: ucode = {OP_ADD, A_ACC, B_CPY, D_T0};        // 2XX
+            6'd11: ucode = {OP_ADD, A_ACC, B_T0,  D_ACC|D_T0};  // M
+            6'd12: ucode = {OP_MUL, A_ACC, B_CPY, D_ACC};       // M^2
+            6'd13: ucode = {OP_SUB, A_ACC, B_T1,  D_ACC};       // M^2 - S
+            6'd14: ucode = {OP_SUB, A_ACC, B_T1,  D_X3};        // X3
+            6'd15: ucode = {OP_ADD, A_0,   B_T1,  D_ACC};       // ACC <- S
+            6'd16: ucode = {OP_SUB, A_ACC, B_X3,  D_ACC};       // S - X3
+            6'd17: ucode = {OP_MUL, A_ACC, B_T0,  D_ACC};       // M(S - X3)
+            6'd18: ucode = {OP_SUB, A_ACC, B_Z3,  D_Y3};        // Y3
+            6'd19: ucode = {OP_ADD, A_Y1,  B_CPY, D_T0};        // 2Y1
+            6'd20: ucode = {OP_MUL, A_Z1,  B_T0,  D_Z3};        // Z3
+            6'd21: ucode = {OP_END, A_0,   B_0,   D_NONE};
 
-                ST_IDLE: begin
-                    done      <= 1'b0;
-                    is_double <= 1'b0;
-                    if (start) begin
-                        busy  <= 1'b1;
-                        state <= ST_CHECK_INF;
-                    end else begin
-                        busy  <= 1'b0;
-                    end
-                end
+            // ===== ADICIÓN: U1=X1*Z2^2, U2=X2*Z1^2, S1=Y1*Z2^3, S2=Y2*Z1^3,
+            //       H=U2-U1, R=S2-S1, X3=R^2-H^3-2*U1*H^2,
+            //       Y3=R(U1*H^2-X3)-S1*H^3, Z3=Z1*Z2*H =====
+            6'd22: ucode = {OP_BZ,  A_Z1,  B_0,   PC_RET2};     // Z1 == 0 -> P2
+            6'd23: ucode = {OP_BZ,  A_Z2,  B_0,   PC_RET1};     // Z2 == 0 -> P1
+            6'd24: ucode = {OP_MUL, A_Z2,  B_CPY, D_T0};        // Z2^2
+            6'd25: ucode = {OP_MUL, A_X1,  B_T0,  D_T1};        // U1
+            6'd26: ucode = {OP_MUL, A_Z2,  B_T0,  D_T0};        // Z2^3
+            6'd27: ucode = {OP_MUL, A_Y1,  B_T0,  D_T0};        // S1
+            6'd28: ucode = {OP_MUL, A_Z1,  B_CPY, D_X3};        // Z1^2
+            6'd29: ucode = {OP_MUL, A_Z1,  B_X3,  D_Y3};        // Z1^3
+            6'd30: ucode = {OP_MUL, A_Y2,  B_Y3,  D_ACC};       // S2
+            6'd31: ucode = {OP_SUB, A_ACC, B_T0,  D_Y3};        // R
+            6'd32: ucode = {OP_MUL, A_X2,  B_X3,  D_ACC};       // U2
+            6'd33: ucode = {OP_SUB, A_ACC, B_T1,  D_ACC|D_X3};  // H
+            6'd34: ucode = {OP_BZ,  A_ACC, B_0,   PC_HZ};       // H == 0 -> caso especial
+            6'd35: ucode = {OP_MUL, A_Z1,  B_X3,  D_Z3};        // Z1*H
+            6'd36: ucode = {OP_MUL, A_Z2,  B_Z3,  D_Z3};        // Z3
+            6'd37: ucode = {OP_MUL, A_ACC, B_CPY, D_ACC};       // H^2
+            6'd38: ucode = {OP_MUL, A_ACC, B_T1,  D_T1};        // V = U1*H^2
+            6'd39: ucode = {OP_MUL, A_ACC, B_X3,  D_ACC|D_X3};  // H^3
+            6'd40: ucode = {OP_MUL, A_ACC, B_T0,  D_T0};        // S1*H^3
+            6'd41: ucode = {OP_ADD, A_0,   B_Y3,  D_ACC};       // ACC <- R
+            6'd42: ucode = {OP_MUL, A_ACC, B_CPY, D_ACC};       // R^2
+            6'd43: ucode = {OP_SUB, A_ACC, B_X3,  D_ACC};       // R^2 - H^3
+            6'd44: ucode = {OP_SUB, A_ACC, B_T1,  D_ACC};       //   - V
+            6'd45: ucode = {OP_SUB, A_ACC, B_T1,  D_X3};        //   - V = X3
+            6'd46: ucode = {OP_ADD, A_0,   B_T1,  D_ACC};       // ACC <- V
+            6'd47: ucode = {OP_SUB, A_ACC, B_X3,  D_ACC};       // V - X3
+            6'd48: ucode = {OP_MUL, A_ACC, B_Y3,  D_ACC};       // R(V - X3)
+            6'd49: ucode = {OP_SUB, A_ACC, B_T0,  D_Y3};        // Y3
+            6'd50: ucode = {OP_END, A_0,   B_0,   D_NONE};
 
-                ST_CHECK_INF: begin
-                    if (op_type == 1'b1) begin // Doubling
-                        if (z1 == {WIDTH{1'b0}}) begin
-                            x3    <= {WIDTH{1'b0}};
-                            y3    <= {WIDTH{1'b0}};
-                            z3    <= {WIDTH{1'b0}};
-                            state <= ST_DONE;
-                        end else begin
-                            fsm_mult_a     <= x1;
-                            fsm_mult_b     <= x1;
-                            fsm_mult_start <= 1'b1;
-                            next_state     <= ST_DBL_XX;
-                            state          <= ST_MULT_WAIT;
-                        end
-                    end else begin // Addition
-                        if (z1 == {WIDTH{1'b0}}) begin
-                            x3    <= x2;
-                            y3    <= y2;
-                            z3    <= z2;
-                            state <= ST_DONE;
-                        end else if (z2 == {WIDTH{1'b0}}) begin
-                            x3    <= x1;
-                            y3    <= y1;
-                            z3    <= z1;
-                            state <= ST_DONE;
-                        end else begin
-                            fsm_mult_a     <= z1;
-                            fsm_mult_b     <= z1;
-                            fsm_mult_start <= 1'b1;
-                            next_state     <= ST_ADD_Z1_SQ;
-                            state          <= ST_MULT_WAIT;
-                        end
-                    end
-                end
+            // H == 0 (ACC = 0, Y3 = R): P == Q si además R == 0
+            6'd51: ucode = {OP_ADD, A_ACC, B_Y3,  D_ACC};       // ACC <- R
+            6'd52: ucode = {OP_INF, A_ACC, 3'd1,  D_NONE};      // is_double <= (R == 0)
 
-                // ============================================================
-                // RUTA DE DOBLAMIENTO (op_type == 1)
-                // ============================================================
-                ST_DBL_XX: begin
-                    t1             <= mult_result; // XX
-                    fsm_mult_a     <= y1;
-                    fsm_mult_b     <= y1;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_YY;
-                    state          <= ST_MULT_WAIT;
-                end
+            // Resultado en el infinito
+            6'd53: ucode = {OP_INF, A_0,   3'd0,  D_NONE};
 
-                ST_DBL_YY: begin
-                    t2             <= mult_result; // YY
-                    fsm_mult_a     <= mult_result;
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_YYYY;
-                    state          <= ST_MULT_WAIT;
-                end
+            // Z1 == 0: resultado = P2
+            6'd54: ucode = {OP_ADD, A_X2,  B_0,   D_X3};
+            6'd55: ucode = {OP_ADD, A_Y2,  B_0,   D_Y3};
+            6'd56: ucode = {OP_ADD, A_Z2,  B_0,   D_Z3};
+            6'd57: ucode = {OP_END, A_0,   B_0,   D_NONE};
 
-                ST_DBL_YYYY: begin
-                    t3             <= mult_result; // YYYY
-                    alu_a          <= t1;          // XX + XX
-                    alu_b          <= t1;
-                    alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_M_PREP;
-                    state          <= ST_ALU_WAIT;
-                end
+            // Z2 == 0: resultado = P1
+            6'd58: ucode = {OP_ADD, A_X1,  B_0,   D_X3};
+            6'd59: ucode = {OP_ADD, A_Y1,  B_0,   D_Y3};
+            6'd60: ucode = {OP_ADD, A_Z1,  B_0,   D_Z3};
+            default: ucode = {OP_END, A_0, B_0,   D_NONE};
+        endcase
+    endfunction
 
-                ST_DBL_M_PREP: begin
-                    reg_a          <= alu_result;  // 2XX
-                    alu_a          <= alu_result;  // 2XX + XX
-                    alu_b          <= t1;
-                    alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_M_FINAL;
-                    state          <= ST_ALU_WAIT;
-                end
+    // ------------------------------------------------------------------------
+    // Registros
+    // ------------------------------------------------------------------------
+    reg  [2:0]       state;
+    reg  [5:0]       pc;
+    reg  [5:0]       pc_nxt;
+    reg  [14:0]      ir;
+    reg  [WIDTH-1:0] acc, t0, t1;
+    reg  [WIDTH:0]   alu_s;            // Etapa 1 de la ALU
+    reg  [WIDTH-1:0] alu_r;            // Resultado de la ALU
+    reg  [WIDTH-1:0] opnd_a, opnd_b;   // Operandos registrados (multiplicador y ALU)
+    reg              mult_start_r;
 
-                ST_DBL_M_FINAL: begin
-                    reg_a          <= alu_result; // M = 3XX
-                    fsm_mult_a     <= x1;
-                    fsm_mult_b     <= t2;        // YY
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_X1_YY;
-                    state          <= ST_MULT_WAIT;
-                end
+    wire [2:0] ir_op  = ir[14:12];
+    wire [2:0] ir_a   = ir[11:9];
+    wire [2:0] ir_b   = ir[8:6];
+    wire [5:0] ir_dst = ir[5:0];
 
-                ST_DBL_X1_YY: begin
-                    alu_a          <= mult_result;
-                    alu_b          <= mult_result;
-                    alu_op         <= 1'b0; // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_S_PREP;
-                    state          <= ST_ALU_WAIT;
-                end
+    // ------------------------------------------------------------------------
+    // Buses de Operandos
+    // ------------------------------------------------------------------------
+    reg [WIDTH-1:0] op_a, op_b;
 
-                ST_DBL_S_PREP: begin
-                    alu_a          <= alu_result;
-                    alu_b          <= alu_result;
-                    alu_op         <= 1'b0; // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_S_CALC;
-                    state          <= ST_ALU_WAIT;
-                end
+    always @(*) begin
+        case (ir_a)
+            A_X1:    op_a = x1;
+            A_Y1:    op_a = y1;
+            A_Z1:    op_a = z1;
+            A_X2:    op_a = x2;
+            A_Y2:    op_a = y2;
+            A_Z2:    op_a = z2;
+            A_ACC:   op_a = acc;
+            default: op_a = {WIDTH{1'b0}};
+        endcase
 
-                ST_DBL_S_CALC: begin
-                    reg_b          <= alu_result; // S = 4*X1*YY
-                    fsm_mult_a     <= reg_a;      // M
-                    fsm_mult_b     <= reg_a;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_M2;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_DBL_M2: begin
-                    t1             <= mult_result; // M^2
-                    alu_a          <= reg_b;       // S + S = 2S
-                    alu_b          <= reg_b;
-                    alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_2S;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_2S: begin
-                    alu_a          <= t1;         // M^2 - 2S
-                    alu_b          <= alu_result; // 2S
-                    alu_op         <= 1'b1;       // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_X3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_X3: begin
-                    x3             <= alu_result;
-                    fsm_mult_a     <= y1;
-                    fsm_mult_b     <= z1;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_Y1_Z1;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_DBL_Y1_Z1: begin
-                    alu_a          <= mult_result; // 2*Y1*Z1
-                    alu_b          <= mult_result;
-                    alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_Z3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_Z3: begin
-                    z3             <= alu_result;
-                    alu_a          <= reg_b;      // S - X3
-                    alu_b          <= x3;
-                    alu_op         <= 1'b1;       // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_S_MINUS_X3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_S_MINUS_X3: begin
-                    t2             <= alu_result; // S - X3
-                    fsm_mult_a     <= reg_a;      // M
-                    fsm_mult_b     <= alu_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_DBL_M_S_X3;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_DBL_M_S_X3: begin
-                    t1             <= mult_result; // M*(S - X3)
-                    alu_a          <= t3;          // YYYY + YYYY = 2YYYY
-                    alu_b          <= t3;
-                    alu_op         <= 1'b0;        // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_8YYYY_1;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_8YYYY_1: begin
-                    alu_a          <= alu_result; // 2YYYY + 2YYYY = 4YYYY
-                    alu_b          <= alu_result;
-                    alu_op         <= 1'b0;       // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_8YYYY_2;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_8YYYY_2: begin
-                    alu_a          <= alu_result; // 4YYYY + 4YYYY = 8YYYY
-                    alu_b          <= alu_result;
-                    alu_op         <= 1'b0;       // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_8YYYY_3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_8YYYY_3: begin
-                    alu_a          <= t1;         // M*(S-X3) - 8YYYY
-                    alu_b          <= alu_result; // 8YYYY
-                    alu_op         <= 1'b1;       // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_DBL_Y3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_DBL_Y3: begin
-                    y3    <= alu_result;
-                    state <= ST_DONE;
-                end
-
-                // ============================================================
-                // RUTA DE ADICIÓN (op_type == 0)
-                // ============================================================
-                ST_ADD_Z1_SQ: begin
-                    t1             <= mult_result; // Z1^2
-                    fsm_mult_a     <= z2;
-                    fsm_mult_b     <= z2;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_Z2_SQ;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_Z2_SQ: begin
-                    t2             <= mult_result; // Z2^2
-                    fsm_mult_a     <= x1;
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_U1;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_U1: begin
-                    t3             <= mult_result; // U1
-                    fsm_mult_a     <= x2;
-                    fsm_mult_b     <= t1;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_U2;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_U2: begin
-                    reg_a          <= mult_result; // U2
-                    alu_a          <= mult_result; // U2 - U1
-                    alu_b          <= t3;
-                    alu_op         <= 1'b1;        // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_CALC_H;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_CALC_H: begin
-                    reg_a          <= alu_result; // H (se conserva en reg_a)
-                    fsm_mult_a     <= z1;
-                    fsm_mult_b     <= t1;         // Z1^2
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_Z1_CU;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_Z1_CU: begin
-                    t1             <= mult_result; // Z1^3
-                    fsm_mult_a     <= y2;
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_S2;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_S2: begin
-                    reg_b          <= mult_result; // S2
-                    fsm_mult_a     <= z2;
-                    fsm_mult_b     <= t2;          // Z2^2
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_Z2_CU;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_Z2_CU: begin
-                    t2             <= mult_result; // Z2^3
-                    fsm_mult_a     <= y1;
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_S1;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_S1: begin
-                    reg_c          <= mult_result; // S1
-                    alu_a          <= reg_b;       // S2 - S1
-                    alu_b          <= mult_result;
-                    alu_op         <= 1'b1;        // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_CALC_R;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_CALC_R: begin
-                    reg_b <= alu_result; // R
-                    if (reg_a == {WIDTH{1'b0}}) begin
-                        if (alu_result == {WIDTH{1'b0}}) begin
-                            is_double <= 1'b1;
-                        end
-                        x3    <= {WIDTH{1'b0}};
-                        y3    <= {WIDTH{1'b0}};
-                        z3    <= {WIDTH{1'b0}};
-                        state <= ST_DONE;
-                    end else begin
-                        fsm_mult_a     <= reg_a; // H
-                        fsm_mult_b     <= reg_a;
-                        fsm_mult_start <= 1'b1;
-                        next_state     <= ST_ADD_H2;
-                        state          <= ST_MULT_WAIT;
-                    end
-                end
-
-                ST_ADD_H2: begin
-                    t1             <= mult_result; // H^2
-                    fsm_mult_a     <= reg_a;       // H
-                    fsm_mult_b     <= mult_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_H3;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_H3: begin
-                    t2             <= mult_result; // H^3
-                    fsm_mult_a     <= t3;          // U1
-                    fsm_mult_b     <= t1;          // H^2
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_V;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_V: begin
-                    t1             <= mult_result; // V
-                    fsm_mult_a     <= reg_b;       // R
-                    fsm_mult_b     <= reg_b;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_R2;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_R2: begin
-                    t3             <= mult_result; // R^2
-                    alu_a          <= mult_result; // R^2 - H^3
-                    alu_b          <= t2;
-                    alu_op         <= 1'b1;        // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_X3_PREP;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_X3_PREP: begin
-                    t3             <= alu_result; // R^2 - H^3
-                    alu_a          <= t1;         // V + V = 2V
-                    alu_b          <= t1;
-                    alu_op         <= 1'b0;       // ADD
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_2V;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_2V: begin
-                    alu_a          <= t3;         // (R^2 - H^3) - 2V
-                    alu_b          <= alu_result; // 2V
-                    alu_op         <= 1'b1;       // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_X3_FINAL;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_X3_FINAL: begin
-                    x3             <= alu_result;
-                    alu_a          <= t1;         // V - X3
-                    alu_b          <= alu_result;
-                    alu_op         <= 1'b1;       // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_V_X3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_V_X3: begin
-                    t1             <= alu_result; // V - X3
-                    fsm_mult_a     <= reg_b;      // R
-                    fsm_mult_b     <= alu_result;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_R_VX3;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_R_VX3: begin
-                    t3             <= mult_result; // R*(V - X3)
-                    fsm_mult_a     <= reg_c;       // S1
-                    fsm_mult_b     <= t2;          // H^3
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_S1_H3;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_S1_H3: begin
-                    alu_a          <= t3;          // R*(V - X3) - S1*H^3
-                    alu_b          <= mult_result; // S1*H^3
-                    alu_op         <= 1'b1;        // SUB
-                    alu_start      <= 1'b1;
-                    alu_next_state <= ST_ADD_Y3;
-                    state          <= ST_ALU_WAIT;
-                end
-
-                ST_ADD_Y3: begin
-                    y3             <= alu_result;
-                    fsm_mult_a     <= z1;
-                    fsm_mult_b     <= z2;
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_Z1_Z2;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_Z1_Z2: begin
-                    fsm_mult_a     <= mult_result; // Z1 * Z2
-                    fsm_mult_b     <= reg_a;       // H
-                    fsm_mult_start <= 1'b1;
-                    next_state     <= ST_ADD_Z3;
-                    state          <= ST_MULT_WAIT;
-                end
-
-                ST_ADD_Z3: begin
-                    z3    <= mult_result;
-                    state <= ST_DONE;
-                end
-
-                // ============================================================
-                // ESTADOS DE ESPERA
-                // ============================================================
-                ST_MULT_WAIT: begin
-                    fsm_mult_start <= 1'b0;
-                    if (mult_done) begin
-                        state <= next_state;
-                    end
-                end
-
-                ST_ALU_WAIT: begin
-                    alu_start <= 1'b0;
-                    if (alu_done) begin
-                        state <= alu_next_state;
-                    end
-                end
-
-                ST_DONE: begin
-                    done  <= 1'b1;
-                    busy  <= 1'b0;
-                    state <= ST_IDLE;
-                end
-
-                default: state <= ST_IDLE;
-            endcase
-        end
+        case (ir_b)
+            B_T0:    op_b = t0;
+            B_T1:    op_b = t1;
+            B_X3:    op_b = x3;
+            B_Y3:    op_b = y3;
+            B_Z3:    op_b = z3;
+            B_CPY:   op_b = op_a;
+            default: op_b = {WIDTH{1'b0}};
+        endcase
     end
 
-endmodule
+    wire a_is_zero = ~|op_a;
 
-// ============================================================================
-// Submódulo Auxiliar: ALU Modular Pipelined de 256 bits (2 ciclos de reloj)
-// Operación: op = 0 -> (A + B) mod P
-//            op = 1 -> (A - B) mod P
-// ============================================================================
-module mod_add_sub_256 #(
-    parameter WIDTH = 256
-)(
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire                 start,
-    input  wire                 op,     // 0: ADD, 1: SUB
-    input  wire [WIDTH-1:0]     a,
-    input  wire [WIDTH-1:0]     b,
-    input  wire [WIDTH-1:0]     p,
-    output reg                  done,
-    output reg  [WIDTH-1:0]     result
-);
+    assign mult_start = mult_start_r;
+    assign mult_a     = opnd_a;
+    assign mult_b     = opnd_b;
 
-    localparam ST_IDLE = 2'd0;
-    localparam ST_CALC = 2'd1;
-    localparam ST_DONE = 2'd2;
+    // ------------------------------------------------------------------------
+    // ALU Modular de 2 Etapas + registro de resultado
+    //   Etapa 1 (S_ALU1): s = A + B  ó  A - B           (257 bits)
+    //   Etapa 2 (S_AWB) : ADD -> s - p si s >= p
+    //                     SUB -> s + p si hubo préstamo
+    // ------------------------------------------------------------------------
+    wire alu_sub = (ir_op == OP_SUB);
+    reg  alu_sub_r;                    // Operación registrada: las etapas no dependen de ir
+    wire alu_add_r = ~alu_sub_r;
 
-    reg [1:0]       state;
-    reg             op_reg;
-    reg [WIDTH:0]   sum_raw;
-    reg [WIDTH:0]   sub_raw;
-    reg [WIDTH-1:0] p_reg;
+    wire [WIDTH:0]   alu_adj     = alu_s + ({1'b0, p} ^ {(WIDTH+1){alu_add_r}}) + alu_add_r;
+    wire             alu_use_adj = alu_sub_r ? alu_s[WIDTH] : ~alu_adj[WIDTH];
+    wire [WIDTH-1:0] alu_res     = alu_use_adj ? alu_adj[WIDTH-1:0] : alu_s[WIDTH-1:0];
+
+    // ------------------------------------------------------------------------
+    // Escritura de Resultados
+    // ------------------------------------------------------------------------
+    wire             wb_en = (state == S_WB) || ((state == S_MWAIT) && mult_done);
+    wire [WIDTH-1:0] wb    = (state == S_WB) ? alu_r : mult_result;
+
+    // ------------------------------------------------------------------------
+    // Secuenciador
+    // ------------------------------------------------------------------------
+    always @(*) begin
+        pc_nxt = pc;
+        case (state)
+            S_IDLE:  if (start)            pc_nxt = op_type ? PC_DBL : PC_ADD;
+            S_EXEC:  if (ir_op == OP_BZ)   pc_nxt = a_is_zero ? ir_dst : pc + 1'b1;
+            S_MWAIT: if (mult_done)        pc_nxt = pc + 1'b1;
+            S_WB:                          pc_nxt = pc + 1'b1;
+            default:                       pc_nxt = pc;
+        endcase
+    end
+
+    // ROM con salida registrada (sin reset)
+    always @(posedge clk) begin
+        ir <= ucode(pc_nxt);
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state   <= ST_IDLE;
-            done    <= 1'b0;
-            result  <= {WIDTH{1'b0}};
-            op_reg  <= 1'b0;
-            sum_raw <= {(WIDTH+1){1'b0}};
-            sub_raw <= {(WIDTH+1){1'b0}};
-            p_reg   <= {WIDTH{1'b0}};
+            state     <= S_IDLE;
+            pc        <= PC_DBL;
+            done      <= 1'b0;
+            busy      <= 1'b0;
+            is_double <= 1'b0;
+            acc       <= {WIDTH{1'b0}};
+            t0        <= {WIDTH{1'b0}};
+            t1        <= {WIDTH{1'b0}};
+            x3        <= {WIDTH{1'b0}};
+            y3        <= {WIDTH{1'b0}};
+            z3        <= {WIDTH{1'b0}};
+            alu_s     <= {(WIDTH+1){1'b0}};
+            alu_sub_r <= 1'b0;
+            alu_r     <= {WIDTH{1'b0}};
+            opnd_a    <= {WIDTH{1'b0}};
+            opnd_b    <= {WIDTH{1'b0}};
+            mult_start_r <= 1'b0;
         end else begin
+            pc           <= pc_nxt;
+            done         <= 1'b0;
+            mult_start_r <= 1'b0;
+
+            if (wb_en) begin
+                if (ir_dst[0]) acc <= wb;
+                if (ir_dst[1]) t0  <= wb;
+                if (ir_dst[2]) t1  <= wb;
+                if (ir_dst[3]) x3  <= wb;
+                if (ir_dst[4]) y3  <= wb;
+                if (ir_dst[5]) z3  <= wb;
+            end
+
             case (state)
-                ST_IDLE: begin
-                    done <= 1'b0;
-                    if (start) begin
-                        op_reg  <= op;
-                        p_reg   <= p;
-                        sum_raw <= {1'b0, a} + {1'b0, b};
-                        sub_raw <= {1'b0, a} - {1'b0, b};
-                        state   <= ST_CALC;
-                    end
+                S_IDLE: begin
+                    is_double <= 1'b0;
+                    busy      <= start;
+                    if (start) state <= S_EXEC;
                 end
 
-                ST_CALC: begin
-                    if (op_reg == 1'b0) begin // ADD: (a + b) mod p
-                        if (sum_raw >= {1'b0, p_reg}) begin
-                            result <= sum_raw[WIDTH-1:0] - p_reg;
-                        end else begin
-                            result <= sum_raw[WIDTH-1:0];
+                S_EXEC: begin
+                    opnd_a <= op_a;
+                    opnd_b <= op_b;
+                    case (ir_op)
+                        OP_MUL: begin
+                            mult_start_r <= 1'b1;
+                            state        <= S_MWAIT;
                         end
-                    end else begin // SUB: (a - b) mod p
-                        if (sub_raw[WIDTH] == 1'b0) begin // a >= b
-                            result <= sub_raw[WIDTH-1:0];
-                        end else begin // a < b
-                            result <= sub_raw[WIDTH-1:0] + p_reg; // Corrección matemática
+
+                        OP_ADD, OP_SUB: begin
+                            alu_sub_r <= alu_sub;
+                            state     <= S_ALU1;
                         end
-                    end
-                    state <= ST_DONE;
+
+                        OP_BZ: state <= S_EXEC;
+
+                        OP_INF: begin
+                            x3        <= {WIDTH{1'b0}};
+                            y3        <= {WIDTH{1'b0}};
+                            z3        <= {WIDTH{1'b0}};
+                            is_double <= ir_b[0] & a_is_zero;
+                            done      <= 1'b1;
+                            busy      <= 1'b0;
+                            state     <= S_IDLE;
+                        end
+
+                        default: begin // OP_END
+                            done  <= 1'b1;
+                            busy  <= 1'b0;
+                            state <= S_IDLE;
+                        end
+                    endcase
                 end
 
-                ST_DONE: begin
-                    done  <= 1'b1;
-                    state <= ST_IDLE;
+                S_MWAIT: if (mult_done) state <= S_EXEC;
+
+                S_ALU1: begin
+                    alu_s <= {1'b0, opnd_a} + ({1'b0, opnd_b} ^ {(WIDTH+1){alu_sub_r}}) + alu_sub_r;
+                    state <= S_AWB;
                 end
 
-                default: state <= ST_IDLE;
+                S_AWB: begin
+                    alu_r <= alu_res;
+                    state <= S_WB;
+                end
+
+                S_WB:    state <= S_EXEC;
+
+                default: state <= S_IDLE;
             endcase
         end
     end
