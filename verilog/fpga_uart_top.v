@@ -20,8 +20,9 @@ module fpga_uart_top (
     wire [255:0] pub_key_x;
     wire [255:0] pub_key_y;
 
-    // Buffer de transmisión de 512 bits (32B Qx + 32B Qy)
-    reg  [511:0] tx_buffer;
+    // Llave pública (32B Qx + 32B Qy): estable desde done hasta la siguiente
+    // llave, así que se transmite directamente con un mux de byte
+    wire [511:0] pub_key = {pub_key_x, pub_key_y};
 
     // ------------------------------------------------------------------------
     // Instancia del Núcleo Criptográfico
@@ -72,7 +73,6 @@ module fpga_uart_top (
             byte_cnt     <= 6'd0;
             start_keygen <= 1'b0;
             k_scalar_reg <= 256'd0;
-            tx_buffer    <= 512'd0;
             tx_start     <= 1'b0;
             tx_byte      <= 8'd0;
         end else begin
@@ -94,26 +94,24 @@ module fpga_uart_top (
                     end
                 end
 
-                // 2. Esperar a que ecc_keygen_top termine y capturar las coordenadas
+                // 2. Esperar a que ecc_keygen_top termine
                 ST_PROCESS: begin
                     start_keygen <= 1'b0;
                     if (done_keygen) begin
-                        // Cargar Qx (MSB) y Qy (LSB) en el buffer
-                        tx_buffer <= {pub_key_x, pub_key_y};
                         k_scalar_reg <= 256'd0; // No retener la llave privada
                         byte_cnt  <= 6'd0;
                         state     <= ST_TX_START;
                     end
                 end
 
-                // 3. Extraer SIEMPRE el byte superior fijo [511:504]
+                // 3. Byte byte_cnt de {Qx, Qy}, MSB primero
                 ST_TX_START: begin
-                    tx_byte  <= tx_buffer[511:504];
+                    tx_byte  <= pub_key[(6'd63 - byte_cnt) * 8 +: 8];
                     tx_start <= 1'b1;
                     state    <= ST_TX_WAIT;
                 end
 
-                // 4. Transmitir y desplazar 8 bits a la izquierda en cada iteración
+                // 4. Transmitir y pasar al siguiente byte
                 ST_TX_WAIT: begin
                     tx_start <= 1'b0;
                     if (!tx_busy && !tx_start) begin
@@ -121,8 +119,6 @@ module fpga_uart_top (
                             byte_cnt <= 6'd0;
                             state    <= ST_RX_BYTES; // Listo para la siguiente llave
                         end else begin
-                            // Shift left de 8 bits para exponer el siguiente byte en [511:504]
-                            tx_buffer <= {tx_buffer[503:0], 8'd0};
                             byte_cnt  <= byte_cnt + 1'b1;
                             state     <= ST_TX_START;
                         end

@@ -1,0 +1,4 @@
+pyserial>=3.5
+# Referencias de secp256k1: basta con una; si hay varias, el script las compara entre sí
+ecdsa>=0.19
+cryptography>=42
