@@ -20,8 +20,10 @@ module ecc_sliding_window_engine #(
     // Datos
     input  wire [WIDTH-1:0]           k_scalar,
     input  wire [WIDTH-1:0]           p,
+    input  wire [WIDTH-1:0]           one_mont, // 1 en dominio Montgomery (R mod p)
 
-    // Interfaz con RAM de Puntos Precomputados
+    // Interfaz con la ROM de Puntos Precomputados (afines, Z = 1)
+    // Lectura síncrona: ram_dout es válido el ciclo siguiente a fijar ram_raddr
     output reg  [WINDOW_SIZE-2:0]     ram_raddr,
     input  wire [WIDTH-1:0]           ram_dout_x,
     input  wire [WIDTH-1:0]           ram_dout_y,
@@ -46,16 +48,17 @@ module ecc_sliding_window_engine #(
 );
 
     // Codificación de Estados
-    localparam ST_IDLE       = 3'd0;
-    localparam ST_SCAN       = 3'd1;
-    localparam ST_READ_RAM   = 3'd2;
-    localparam ST_DBL_LOOP   = 3'd3;
-    localparam ST_WAIT_DBL   = 3'd4;
-    localparam ST_ADD        = 3'd5;
-    localparam ST_WAIT_ADD   = 3'd6;
-    localparam ST_DONE       = 3'd7;
+    localparam ST_IDLE       = 4'd0;
+    localparam ST_SCAN       = 4'd1;
+    localparam ST_READ_RAM   = 4'd2;
+    localparam ST_DBL_LOOP   = 4'd3;
+    localparam ST_WAIT_DBL   = 4'd4;
+    localparam ST_ADD        = 4'd5;
+    localparam ST_WAIT_ADD   = 4'd6;
+    localparam ST_DONE       = 4'd7;
+    localparam ST_ROM_WAIT   = 4'd8;  // Latencia de lectura de la ROM síncrona
 
-    reg [2:0]       state;
+    reg [3:0]       state;
     reg [8:0]       bits_left;   // Contador de 256 a 0
     reg [WIDTH-1:0] k_reg;       // Registro de desplazamiento
     reg             is_first;    // Carga inicial del primer punto
@@ -65,22 +68,24 @@ module ecc_sliding_window_engine #(
     assign op_type = (state == ST_DBL_LOOP || state == ST_WAIT_DBL) ? 1'b1 : 1'b0;
 
     // Decodificador de ventana Sliding Window (Ventana Impar Dinámica de 1 a 6 bits)
+    // La ROM guarda (2i+1)G en la dirección i: una ventana impar de valor v
+    // (MSB en k_reg[255]) se lee en la dirección v >> 1.
     reg [2:0]             dec_len;
     reg [WINDOW_SIZE-2:0] dec_addr;
 
     always @(*) begin
         if (k_reg[250]) begin
             dec_len  = 3'd6;
-            dec_addr = k_reg[254:250];
+            dec_addr = k_reg[255:251];
         end else if (k_reg[251]) begin
             dec_len  = 3'd5;
-            dec_addr = {1'b0, k_reg[254:251]};
+            dec_addr = {1'b0, k_reg[255:252]};
         end else if (k_reg[252]) begin
             dec_len  = 3'd4;
-            dec_addr = {2'b00, k_reg[254:252]};
+            dec_addr = {2'b00, k_reg[255:253]};
         end else if (k_reg[253]) begin
             dec_len  = 3'd3;
-            dec_addr = {3'b000, k_reg[254:253]};
+            dec_addr = {3'b000, k_reg[255:254]};
         end else if (k_reg[254]) begin
             dec_len  = 3'd2;
             dec_addr = 5'd1; // 3G
@@ -121,6 +126,10 @@ module ecc_sliding_window_engine #(
                         k_reg     <= k_scalar;
                         bits_left <= 9'd256;
                         is_first  <= 1'b1;
+                        // Q = infinito (Z = 0): con k = 0 no se reutiliza el resultado anterior
+                        x_out     <= {WIDTH{1'b0}};
+                        y_out     <= {WIDTH{1'b0}};
+                        z_out     <= {WIDTH{1'b0}};
                         state     <= ST_SCAN;
                     end else begin
                         busy      <= 1'b0;
@@ -146,16 +155,19 @@ module ecc_sliding_window_engine #(
                         win_len   <= dec_len;
                         dbl_cnt   <= dec_len;
                         ram_raddr <= dec_addr;
-                        state     <= ST_READ_RAM;
+                        state     <= ST_ROM_WAIT;
                     end
                 end
+
+                // La ROM captura ram_raddr en este flanco: ram_dout es válido en ST_READ_RAM
+                ST_ROM_WAIT: state <= ST_READ_RAM;
 
                 ST_READ_RAM: begin
                     if (is_first) begin
                         // Cargar primer punto directamente sin doblar ni sumar
                         x_out     <= ram_dout_x;
                         y_out     <= ram_dout_y;
-                        z_out     <= 256'd1;
+                        z_out     <= one_mont;
                         is_first  <= 1'b0;
                         k_reg     <= k_reg << win_len;
                         bits_left <= bits_left - win_len;
@@ -204,7 +216,7 @@ module ecc_sliding_window_engine #(
                     add_z1    <= z_out;
                     add_x2    <= ram_dout_x;
                     add_y2    <= ram_dout_y;
-                    add_z2    <= 256'd1;
+                    add_z2    <= one_mont;
                     add_start <= 1'b1;
                     state     <= ST_WAIT_ADD;
                 end

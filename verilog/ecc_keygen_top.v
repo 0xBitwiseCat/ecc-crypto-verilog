@@ -3,6 +3,10 @@
 // Descripción: Orquestador Top-Level y Banco Central de Registros para secp256k1.
 //              Gerencia el tiempo compartido del Operador Jacobiano Unificado
 //              (jacobian_point_op) y del Multiplicador de Montgomery.
+//              La tabla de puntos impares 1G..63G es constante (ecc_point_rom),
+//              generada por golden_model/gen_point_rom.py.
+// Escalar: k = 0 o k = n producen el punto en el infinito -> Q = (0, 0).
+//          k > n produce (k mod n)*G.
 // Optimizado para: Intel Cyclone IV (EP4CE6E22C8)
 // ============================================================================
 
@@ -13,7 +17,7 @@ module ecc_keygen_top #(
     input  wire                 clk,
     input  wire                 rst_n,
 
-    // Control Principal
+    // Control Principal (k_scalar se captura en el mismo flanco que start)
     input  wire                 start,
     input  wire [WIDTH-1:0]     k_scalar,
     output reg                  done,
@@ -24,35 +28,28 @@ module ecc_keygen_top #(
 );
 
     // ------------------------------------------------------------------------
-    // Parámetros de la Curva secp256k1 (Dominio Montgomery)
+    // Parámetros de la Curva secp256k1 (Dominio Montgomery, R = 2^256)
     // ------------------------------------------------------------------------
     localparam [WIDTH-1:0] SECP256K1_P = 256'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
-    localparam [15:0]      N_PRIME0    = 16'h2ECD; // (-P^-1) mod 2^16 para secp256k1
-
-    // Generador G(x, y) codificado en Dominio Montgomery (G * R mod p)
-    localparam [WIDTH-1:0] GX_MONT = 256'h322362135D38C87A6564B59960256BCE66164223A4D0070A647EEB23C938221D;
-    localparam [WIDTH-1:0] GY_MONT = 256'hB0118D6027A1A31C2C944D76DE5C0A02701F909A670F68FE9A04B6D8D701A79B;
+    localparam [15:0]      N_PRIME0    = 16'h3531; // (-P^-1) mod 2^16 para secp256k1
+    localparam [WIDTH-1:0] ONE_MONT    = 256'h1000003D1; // 1 en Montgomery = R mod p
 
     // ------------------------------------------------------------------------
     // Codificación de Estados de la FSM Top-Level
     // ------------------------------------------------------------------------
-    localparam ST_IDLE       = 3'd0;
-    localparam ST_PRECOMPUTE = 3'd1;
-    localparam ST_SCALAR_MULT= 3'd2;
-    localparam ST_CONVERT    = 3'd3;
-    localparam ST_DONE       = 3'd4;
+    localparam ST_IDLE       = 2'd0;
+    localparam ST_SCALAR_MULT= 2'd1;
+    localparam ST_CONVERT    = 2'd2;
+    localparam ST_DONE       = 2'd3;
 
-    reg [2:0] state;
+    reg [1:0] state;
 
     // ------------------------------------------------------------------------
     // Banco Central de Registros e Interconexión
     // ------------------------------------------------------------------------
-    // Control FSM Principal
-    reg  precomp_start;
-    wire precomp_done;
-    wire precomp_busy;
-
-    reg  sw_start;
+    // Control FSM Principal: el motor arranca en el mismo flanco que start
+    // para capturar k_scalar sin depender de que la entrada siga estable.
+    wire sw_start = (state == ST_IDLE) && start;
     wire sw_done;
     wire sw_busy;
     wire [WIDTH-1:0] sw_x, sw_y, sw_z;
@@ -61,50 +58,15 @@ module ecc_keygen_top #(
     wire conv_done;
     wire conv_busy;
 
-    // Interfaz Memoria RAM Dual-Port (Puntos Precomputados)
-    wire                    ram_we;
-    wire [WINDOW_SIZE-2:0]  ram_waddr;
-    wire [WIDTH-1:0]        ram_din_x, ram_din_y;
-    wire [WINDOW_SIZE-2:0]  ram_raddr;
-    wire [WIDTH-1:0]        ram_dout_x, ram_dout_y;
-
-    // Señales del Precomputador
-    wire        precomp_dbl_start, precomp_add_start;
-    wire [WIDTH-1:0] precomp_dbl_x1, precomp_dbl_y1, precomp_dbl_z1;
-    wire [WIDTH-1:0] precomp_add_x1, precomp_add_y1, precomp_add_z1;
-    wire [WIDTH-1:0] precomp_add_x2, precomp_add_y2, precomp_add_z2;
-
-    wire        precomp_op_start;
-    wire        precomp_op_type;
-    wire [WIDTH-1:0] precomp_op_x1, precomp_op_y1, precomp_op_z1;
-    wire [WIDTH-1:0] precomp_op_x2, precomp_op_y2, precomp_op_z2;
-
-    assign precomp_op_start = precomp_op_type ? precomp_dbl_start : precomp_add_start;
-    assign precomp_op_x1    = precomp_op_type ? precomp_dbl_x1    : precomp_add_x1;
-    assign precomp_op_y1    = precomp_op_type ? precomp_dbl_y1    : precomp_add_y1;
-    assign precomp_op_z1    = precomp_op_type ? precomp_dbl_z1    : precomp_add_z1;
-    assign precomp_op_x2    = precomp_add_x2;
-    assign precomp_op_y2    = precomp_add_y2;
-    assign precomp_op_z2    = precomp_add_z2;
+    // Interfaz ROM (Puntos Precomputados)
+    wire [WINDOW_SIZE-2:0]  rom_addr;
+    wire [WIDTH-1:0]        rom_dout_x, rom_dout_y;
 
     // Señales del Motor de Ventana
     wire        sw_add_start, sw_dbl_start;
     wire [WIDTH-1:0] sw_add_x1, sw_add_y1, sw_add_z1;
     wire [WIDTH-1:0] sw_add_x2, sw_add_y2, sw_add_z2;
     wire [WIDTH-1:0] sw_dbl_x1, sw_dbl_y1, sw_dbl_z1;
-
-    wire        sw_op_start;
-    wire        sw_op_type;
-    wire [WIDTH-1:0] sw_op_x1, sw_op_y1, sw_op_z1;
-    wire [WIDTH-1:0] sw_op_x2, sw_op_y2, sw_op_z2;
-
-    assign sw_op_start = sw_op_type ? sw_dbl_start : sw_add_start;
-    assign sw_op_x1    = sw_op_type ? sw_dbl_x1    : sw_add_x1;
-    assign sw_op_y1    = sw_op_type ? sw_dbl_y1    : sw_add_y1;
-    assign sw_op_z1    = sw_op_type ? sw_dbl_z1    : sw_add_z1;
-    assign sw_op_x2    = sw_add_x2;
-    assign sw_op_y2    = sw_add_y2;
-    assign sw_op_z2    = sw_add_z2;
 
     // Señales del Operador Jacobiano Unificado
     wire        op_start;
@@ -131,14 +93,13 @@ module ecc_keygen_top #(
     // ------------------------------------------------------------------------
     // Multiplexado del Banco Central
     // ------------------------------------------------------------------------
-    assign op_start = precomp_busy ? precomp_op_start : sw_op_start;
-    assign op_type  = precomp_busy ? precomp_op_type  : sw_op_type;
-    assign op_x1    = precomp_busy ? precomp_op_x1    : sw_op_x1;
-    assign op_y1    = precomp_busy ? precomp_op_y1    : sw_op_y1;
-    assign op_z1    = precomp_busy ? precomp_op_z1    : sw_op_z1;
-    assign op_x2    = precomp_busy ? precomp_op_x2    : sw_op_x2;
-    assign op_y2    = precomp_busy ? precomp_op_y2    : sw_op_y2;
-    assign op_z2    = precomp_busy ? precomp_op_z2    : sw_op_z2;
+    assign op_start = op_type ? sw_dbl_start : sw_add_start;
+    assign op_x1    = op_type ? sw_dbl_x1    : sw_add_x1;
+    assign op_y1    = op_type ? sw_dbl_y1    : sw_add_y1;
+    assign op_z1    = op_type ? sw_dbl_z1    : sw_add_z1;
+    assign op_x2    = sw_add_x2;
+    assign op_y2    = sw_add_y2;
+    assign op_z2    = sw_add_z2;
 
     assign mult_start = op_busy ? op_mult_start : conv_mult_start;
     assign mult_a     = op_busy ? op_mult_a     : conv_mult_a;
@@ -148,49 +109,26 @@ module ecc_keygen_top #(
     // Instanciación de Submódulos
     // ------------------------------------------------------------------------
 
-    // 1. Memoria RAM BRAM M9K
-    ecc_point_ram #(
+    // 1. ROM M9K de Puntos Precomputados (afines, Montgomery)
+    ecc_point_rom #(
         .WIDTH(WIDTH),
         .WINDOW_SIZE(WINDOW_SIZE)
-    ) point_ram_inst (
+    ) point_rom_inst (
         .clk(clk),
-        .we(ram_we),
-        .waddr(ram_waddr),
-        .din_x(ram_din_x),
-        .din_y(ram_din_y),
-        .raddr(ram_raddr),
-        .dout_x(ram_dout_x),
-        .dout_y(ram_dout_y)
+        .addr(rom_addr),
+        .dout_x(rom_dout_x),
+        .dout_y(rom_dout_y)
     );
 
-    // 2. Precomputación
-    ecc_precompute_fsm #(
-        .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
-    ) precomp_inst (
-        .clk(clk), .rst_n(rst_n),
-        .start(precomp_start), .done(precomp_done), .busy(precomp_busy),
-        .op_type(precomp_op_type),
-        .gx_mont(GX_MONT), .gy_mont(GY_MONT), .p(SECP256K1_P),
-        .ram_we(ram_we), .ram_waddr(ram_waddr),
-        .ram_din_x(ram_din_x), .ram_din_y(ram_din_y),
-        .dbl_start(precomp_dbl_start), .dbl_done(op_done && precomp_busy),
-        .dbl_x1(precomp_dbl_x1), .dbl_y1(precomp_dbl_y1), .dbl_z1(precomp_dbl_z1),
-        .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
-        .add_start(precomp_add_start), .add_done(op_done && precomp_busy),
-        .add_x1(precomp_add_x1), .add_y1(precomp_add_y1), .add_z1(precomp_add_z1),
-        .add_x2(precomp_add_x2), .add_y2(precomp_add_y2), .add_z2(precomp_add_z2),
-        .add_x3(op_x3), .add_y3(op_y3), .add_z3(op_z3)
-    );
-
-    // 3. Motor de Ventana
+    // 2. Motor de Ventana
     ecc_sliding_window_engine #(
         .WIDTH(WIDTH), .WINDOW_SIZE(WINDOW_SIZE)
     ) sw_engine_inst (
         .clk(clk), .rst_n(rst_n),
         .start(sw_start), .done(sw_done), .busy(sw_busy),
-        .op_type(sw_op_type),
-        .k_scalar(k_scalar), .p(SECP256K1_P),
-        .ram_raddr(ram_raddr), .ram_dout_x(ram_dout_x), .ram_dout_y(ram_dout_y),
+        .op_type(op_type),
+        .k_scalar(k_scalar), .p(SECP256K1_P), .one_mont(ONE_MONT),
+        .ram_raddr(rom_addr), .ram_dout_x(rom_dout_x), .ram_dout_y(rom_dout_y),
         .add_start(sw_add_start), .add_done(op_done && sw_busy),
         .add_x1(sw_add_x1), .add_y1(sw_add_y1), .add_z1(sw_add_z1),
         .add_x2(sw_add_x2), .add_y2(sw_add_y2), .add_z2(sw_add_z2),
@@ -200,8 +138,8 @@ module ecc_keygen_top #(
         .dbl_x3(op_x3), .dbl_y3(op_y3), .dbl_z3(op_z3),
         .x_out(sw_x), .y_out(sw_y), .z_out(sw_z)
     );
-    
-    // 4. Operador Jacobiano Unificado
+
+    // 3. Operador Jacobiano Unificado
     jacobian_point_op #(
         .WIDTH(WIDTH)
     ) point_op_inst (
@@ -211,7 +149,6 @@ module ecc_keygen_top #(
         .op_type(op_type),
         .done(op_done),
         .busy(op_busy),
-        .is_double(),
         .x1(op_x1),
         .y1(op_y1),
         .z1(op_z1),
@@ -229,7 +166,7 @@ module ecc_keygen_top #(
         .mult_result(mult_result)
     );
 
-    // 5. Multiplicador de Montgomery Compartido
+    // 4. Multiplicador de Montgomery Compartido
     montgomery_multiplier #(
         .WIDTH(WIDTH)
     ) mont_mult_inst (
@@ -245,7 +182,7 @@ module ecc_keygen_top #(
         .result(mult_result)
     );
 
-    // 6. Conversor a Coordenadas Afines Normales
+    // 5. Conversor a Coordenadas Afines Normales
     domain_coordinate_converter #(
         .WIDTH(WIDTH)
     ) domain_conv_inst (
@@ -274,33 +211,19 @@ module ecc_keygen_top #(
         if (!rst_n) begin
             state         <= ST_IDLE;
             done          <= 1'b0;
-            precomp_start <= 1'b0;
-            sw_start      <= 1'b0;
             conv_start    <= 1'b0;
         end else begin
             case (state)
 
                 ST_IDLE: begin
                     done          <= 1'b0;
-                    precomp_start <= 1'b0;
-                    sw_start      <= 1'b0;
                     conv_start    <= 1'b0;
                     if (start) begin
-                        precomp_start <= 1'b1;
-                        state         <= ST_PRECOMPUTE;
-                    end
-                end
-
-                ST_PRECOMPUTE: begin
-                    precomp_start <= 1'b0;
-                    if (precomp_done) begin
-                        sw_start <= 1'b1;
-                        state    <= ST_SCALAR_MULT;
+                        state     <= ST_SCALAR_MULT; // sw_start = start en este ciclo
                     end
                 end
 
                 ST_SCALAR_MULT: begin
-                    sw_start <= 1'b0;
                     if (sw_done) begin
                         conv_start <= 1'b1;
                         state      <= ST_CONVERT;

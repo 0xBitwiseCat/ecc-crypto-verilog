@@ -100,6 +100,7 @@ module fpga_uart_top (
                     if (done_keygen) begin
                         // Cargar Qx (MSB) y Qy (LSB) en el buffer
                         tx_buffer <= {pub_key_x, pub_key_y};
+                        k_scalar_reg <= 256'd0; // No retener la llave privada
                         byte_cnt  <= 6'd0;
                         state     <= ST_TX_START;
                     end

@@ -23,7 +23,6 @@ module jacobian_point_op #(
     input  wire                 op_type,   // 0: Addition (P + Q), 1: Doubling (2P)
     output reg                  done,
     output reg                  busy,
-    output reg                  is_double, // Detecta P == Q durante Adición
 
     // Coordenadas Jacobianas de Entrada (Montgomery)
     // Deben mantenerse estables mientras busy = 1
@@ -55,7 +54,6 @@ module jacobian_point_op #(
     // ------------------------------------------------------------------------
     // Formato de Microinstrucción: {op[14:12], a[11:9], b[8:6], dst[5:0]}
     //   OP_BZ : dst = dirección de salto si A == 0
-    //   OP_INF: b[0] = 1 -> is_double <= (A == 0)
     // ------------------------------------------------------------------------
     localparam [2:0] OP_MUL = 3'd0;  // dst <- A * B (Montgomery)
     localparam [2:0] OP_ADD = 3'd1;  // dst <- (A + B) mod p
@@ -166,10 +164,10 @@ module jacobian_point_op #(
 
             // H == 0 (ACC = 0, Y3 = R): P == Q si además R == 0
             6'd51: ucode = {OP_ADD, A_ACC, B_Y3,  D_ACC};       // ACC <- R
-            6'd52: ucode = {OP_INF, A_ACC, 3'd1,  D_NONE};      // is_double <= (R == 0)
+            6'd52: ucode = {OP_BZ,  A_ACC, B_0,   PC_DBL};      // R == 0 -> P1 + P1 = 2*P1
 
-            // Resultado en el infinito
-            6'd53: ucode = {OP_INF, A_0,   3'd0,  D_NONE};
+            // Resultado en el infinito (P == -Q o Z1 == 0 en doblamiento)
+            6'd53: ucode = {OP_INF, A_0,   B_0,   D_NONE};
 
             // Z1 == 0: resultado = P2
             6'd54: ucode = {OP_ADD, A_X2,  B_0,   D_X3};
@@ -282,7 +280,6 @@ module jacobian_point_op #(
             pc        <= PC_DBL;
             done      <= 1'b0;
             busy      <= 1'b0;
-            is_double <= 1'b0;
             acc       <= {WIDTH{1'b0}};
             t0        <= {WIDTH{1'b0}};
             t1        <= {WIDTH{1'b0}};
@@ -311,7 +308,6 @@ module jacobian_point_op #(
 
             case (state)
                 S_IDLE: begin
-                    is_double <= 1'b0;
                     busy      <= start;
                     if (start) state <= S_EXEC;
                 end
@@ -336,7 +332,6 @@ module jacobian_point_op #(
                             x3        <= {WIDTH{1'b0}};
                             y3        <= {WIDTH{1'b0}};
                             z3        <= {WIDTH{1'b0}};
-                            is_double <= ir_b[0] & a_is_zero;
                             done      <= 1'b1;
                             busy      <= 1'b0;
                             state     <= S_IDLE;
